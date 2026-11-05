@@ -3,7 +3,7 @@
   "schemaVersion": 1,
   "apiVersion": 1,
   "id": "dev.maxlec.tieba",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "defaultLocale": "zh-Hans",
   "name": { "key": "plugin.name", "fallback": "Tieba" },
   "description": { "key": "plugin.description", "fallback": "Baidu Tieba forums, threads and replies" },
@@ -13,6 +13,9 @@
   "platform": {
     "id": "tieba",
     "name": { "key": "platform.name", "fallback": "Tieba" },
+    "detector": {
+      "priority": 0
+    },
     "loginMethods": [
       {
         "id": "browser",

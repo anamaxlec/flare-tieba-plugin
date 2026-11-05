@@ -19,7 +19,7 @@
 
 ### 从 GitHub 安装
 
-在 Flare 的插件管理里填入本仓库地址并点击 **Install**，确认权限后选择平台 `贴吧`，origin 填 `https://tieba.baidu.com`，然后走浏览器登录。
+在 Flare 的插件管理里填入本仓库地址并点击 **Install**，确认权限后进入添加账号页，输入 `tieba.baidu.com`（不用带 `https://`），检测到「贴吧」后走浏览器登录。
 
 插件需要 `mediaNetwork` 权限，用于加载贴吧头像和帖子图片（`himg.bdimg.com`、`imgsrc.baidu.com`、`tiebapic.baidu.com` 等 CDN）。
 

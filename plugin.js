@@ -6,11 +6,30 @@
   var POST_CAPABILITY = "flare.datasource.post/v1";
   var THREADS_PER_PAGE = 30;
   var MAX_THREAD_PAGES = 20;
+  var TIEBA_HOST = "tieba.baidu.com";
+  var TIEBA_ORIGIN = "https://" + TIEBA_HOST;
   var JSON_HEADERS = {
     Accept: "application/json, text/plain, */*",
     "X-Requested-With": "com.baidu.tieba"
   };
   defineFlareSocialPlugin({
+    detector: {
+      detect(request) {
+        if (request.origin.toLowerCase() !== TIEBA_ORIGIN) {
+          return { match: "none", canonicalOrigin: request.origin };
+        }
+        return {
+          match: "exact",
+          canonicalOrigin: request.origin,
+          software: "Baidu Tieba",
+          instance: {
+            domain: TIEBA_HOST,
+            title: "\u767E\u5EA6\u8D34\u5427",
+            description: "Baidu Tieba forums, threads and replies"
+          }
+        };
+      }
+    },
     login: {
       browser: {
         async begin(_request, context) {

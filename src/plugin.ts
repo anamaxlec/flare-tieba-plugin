@@ -5,6 +5,9 @@ const POST_CAPABILITY = "flare.datasource.post/v1";
 const THREADS_PER_PAGE = 30;
 const MAX_THREAD_PAGES = 20;
 
+const TIEBA_HOST = "tieba.baidu.com";
+const TIEBA_ORIGIN = "https://" + TIEBA_HOST;
+
 const JSON_HEADERS = {
   Accept: "application/json, text/plain, */*",
   "X-Requested-With": "com.baidu.tieba",
@@ -26,6 +29,23 @@ type ThreadFloor = {
 };
 
 defineFlareSocialPlugin({
+  detector: {
+    detect(request) {
+      if (request.origin.toLowerCase() !== TIEBA_ORIGIN) {
+        return { match: "none", canonicalOrigin: request.origin };
+      }
+      return {
+        match: "exact",
+        canonicalOrigin: request.origin,
+        software: "Baidu Tieba",
+        instance: {
+          domain: TIEBA_HOST,
+          title: "百度贴吧",
+          description: "Baidu Tieba forums, threads and replies",
+        },
+      };
+    },
+  },
   login: {
     browser: {
       async begin(_request, context) {
