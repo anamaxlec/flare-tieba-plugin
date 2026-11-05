@@ -1,0 +1,7 @@
+{
+  "plugin.name": "贴吧",
+  "plugin.description": "百度贴吧：逛吧、看帖、看楼中楼",
+  "platform.name": "贴吧",
+  "login.browser.title": "在浏览器中登录",
+  "timeline.hot.title": "贴吧热议"
+}

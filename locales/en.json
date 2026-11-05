@@ -1,0 +1,7 @@
+{
+  "plugin.name": "Tieba",
+  "plugin.description": "Baidu Tieba forums, threads and replies",
+  "platform.name": "Tieba",
+  "login.browser.title": "Sign in with browser",
+  "timeline.hot.title": "Hot topics"
+}
