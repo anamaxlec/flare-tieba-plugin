@@ -3,16 +3,28 @@
   "schemaVersion": 1,
   "apiVersion": 1,
   "id": "dev.maxlec.tieba",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "defaultLocale": "zh-Hans",
-  "name": { "key": "plugin.name", "fallback": "Tieba" },
-  "description": { "key": "plugin.description", "fallback": "Baidu Tieba forums, threads and replies" },
+  "name": {
+    "key": "plugin.name",
+    "fallback": "Tieba"
+  },
+  "description": {
+    "key": "plugin.description",
+    "fallback": "Read Baidu Tieba forums, threads and replies in Flare"
+  },
   "permissions": {
-    "mediaNetwork": true
+    "mediaNetwork": true,
+    "authOrigins": [
+      "https://wappass.baidu.com"
+    ]
   },
   "platform": {
     "id": "tieba",
-    "name": { "key": "platform.name", "fallback": "Tieba" },
+    "name": {
+      "key": "platform.name",
+      "fallback": "Tieba"
+    },
     "detector": {
       "priority": 0
     },
@@ -20,15 +32,36 @@
       {
         "id": "browser",
         "interaction": "WebCookie",
-        "title": { "key": "login.browser.title", "fallback": "Sign in with browser" },
+        "title": {
+          "key": "login.browser.title",
+          "fallback": "Sign in with browser"
+        },
         "cookie": {
-          "startUrl": "$accountOrigin/",
+          "startUrl": "https://wappass.baidu.com/passport/?login&tpl=tb&u=https%3A%2F%2Ftieba.baidu.com%2Fmo%2Fq%2Ffrs%3Fkw%3D%25E6%2595%25B0%25E7%25A0%2581",
           "probes": [
             {
               "url": "$accountOrigin/mo/q/newmoindex?need_user=1",
               "cookies": [
-                { "name": "BDUSS", "required": true },
-                { "name": "BAIDUID", "required": true }
+                {
+                  "name": "BDUSS",
+                  "required": true
+                },
+                {
+                  "name": "BDUSS_BFESS",
+                  "required": false
+                },
+                {
+                  "name": "BAIDUID",
+                  "required": false
+                },
+                {
+                  "name": "BAIDUID_BFESS",
+                  "required": false
+                },
+                {
+                  "name": "STOKEN",
+                  "required": false
+                }
               ]
             }
           ]
@@ -39,7 +72,10 @@
       "flare.datasource.timeline/v1": {
         "operations": {
           "page": {
-            "directions": ["refresh", "older"]
+            "directions": [
+              "refresh",
+              "older"
+            ]
           }
         }
       },
@@ -51,17 +87,96 @@
       "flare.datasource.post/v1": {
         "operations": {
           "detail": {},
-          "context": {}
+          "context": {
+            "directions": [
+              "refresh",
+              "older"
+            ]
+          }
+        }
+      },
+      "flare.datasource.search/v1": {
+        "operations": {
+          "posts": {
+            "directions": [
+              "refresh",
+              "older"
+            ]
+          },
+          "profiles": {
+            "directions": [
+              "refresh",
+              "older"
+            ]
+          },
+          "discoverPosts": {
+            "directions": [
+              "refresh",
+              "older"
+            ]
+          },
+          "discoverProfiles": {
+            "directions": [
+              "refresh",
+              "older"
+            ]
+          },
+          "discoverHashtags": {
+            "directions": [
+              "refresh",
+              "older"
+            ]
+          }
+        }
+      },
+      "flare.datasource.profile/v1": {
+        "operations": {
+          "byId": {},
+          "byHandle": {}
         }
       }
     },
     "timelines": [
       {
         "id": "hot",
-        "title": { "key": "timeline.hot.title", "fallback": "Hot topics" },
+        "title": {
+          "key": "timeline.hot.title",
+          "fallback": "Hot topics"
+        },
         "icon": "Featured",
         "display": "List",
         "defaultForNewAccount": true
+      },
+      {
+        "id": "recommend",
+        "title": {
+          "key": "timeline.recommend.title",
+          "fallback": "Recommended posts"
+        },
+        "icon": "Home",
+        "display": "List"
+      }
+    ],
+    "guest": {
+      "enabled": true
+    },
+    "deepLinks": [
+      {
+        "origin": "$accountOrigin",
+        "path": [
+          {
+            "type": "literal",
+            "value": "p"
+          },
+          {
+            "type": "capture",
+            "name": "id"
+          }
+        ],
+        "target": {
+          "type": "Post",
+          "value": "{id}"
+        }
       }
     ]
   }

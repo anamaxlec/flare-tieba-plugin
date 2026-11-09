@@ -1,96 +1,73 @@
-const TIMELINE_CAPABILITY = "flare.datasource.timeline/v1";
-const TAB_CATALOG_CAPABILITY = "flare.datasource.tab-catalog/v1";
-const POST_CAPABILITY = "flare.datasource.post/v1";
-
-const THREADS_PER_PAGE = 30;
-const MAX_THREAD_PAGES = 20;
-
 const TIEBA_HOST = "tieba.baidu.com";
 const TIEBA_ORIGIN = "https://" + TIEBA_HOST;
-
+const LOGIN_URL = "https://wappass.baidu.com/passport/?login&tpl=tb&u=https%3A%2F%2Ftieba.baidu.com%2Fmo%2Fq%2Ffrs%3Fkw%3D%25E6%2595%25B0%25E7%25A0%2581";
+const ACCOUNT_PATH = "/mo/q/newmoindex?need_user=1";
+const CATALOG_PATH = "/mg/o/getForumHome?st=0&pn=0&rn=50&eqid=&refer=";
+const LANGUAGE = ["zh-CN"];
 const JSON_HEADERS = {
   Accept: "application/json, text/plain, */*",
-  "X-Requested-With": "com.baidu.tieba",
+  "Accept-Language": "zh-CN,zh;q=0.9",
+  Referer: TIEBA_ORIGIN + "/",
+  "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36",
+  "X-Requested-With": "XMLHttpRequest",
+};
+
+const CAPABILITIES = {
+  "flare.datasource.timeline/v1": ["page"],
+  "flare.datasource.tab-catalog/v1": ["page"],
+  "flare.datasource.post/v1": ["detail", "context"],
+  "flare.datasource.search/v1": ["posts", "profiles", "discoverPosts", "discoverProfiles", "discoverHashtags"],
+  "flare.datasource.profile/v1": ["byId", "byHandle"],
 };
 
 type JsonObject = Record<string, unknown>;
 type TiebaCookie = { name: string; value: string };
-
-type ThreadFloor = {
-  tid: string;
+type Floor = {
   pid: string;
-  floor: number;
-  userName: string;
-  displayName: string;
-  portrait: string;
-  contentHtml: string;
+  index: number;
+  author?: ProfileV1;
   title: string;
-  timeText: string;
+  content: string;
+  time: string;
+  media: MediaV1[];
+  repliesCount?: number;
 };
 
 defineFlareSocialPlugin({
   detector: {
-    detect(request) {
-      if (request.origin.toLowerCase() !== TIEBA_ORIGIN) {
-        return { match: "none", canonicalOrigin: request.origin };
-      }
+    detect({ origin }) {
+      if (origin.toLowerCase() !== TIEBA_ORIGIN) return { match: "none", canonicalOrigin: origin };
       return {
         match: "exact",
-        canonicalOrigin: request.origin,
+        canonicalOrigin: TIEBA_ORIGIN,
         software: "Baidu Tieba",
-        instance: {
-          domain: TIEBA_HOST,
-          title: "百度贴吧",
-          description: "Baidu Tieba forums, threads and replies",
-        },
+        instance: { domain: TIEBA_HOST, title: "百度贴吧" },
       };
     },
   },
   login: {
     browser: {
-      async begin(_request, context) {
-        return { type: "webCookie", startUrl: context.origin + "/" };
+      begin() {
+        return { type: "webCookie", startUrl: LOGIN_URL };
       },
       async check(request, context) {
-        const probeUrl = context.origin + "/mo/q/newmoindex?need_user=1";
+        const probe = context.origin + ACCOUNT_PATH;
         const cookies = request.cookies.cookies
-          .filter((cookie) => cookie.sourceUrl === probeUrl)
+          .filter((cookie) => cookie.sourceUrl === probe && cookie.value)
           .map(({ name, value }) => ({ name, value }));
-        if (!hasCookie(cookies, "BDUSS") || !hasCookie(cookies, "BAIDUID")) {
+        if (!cookies.some(({ name }) => name === "BDUSS" || name === "BDUSS_BFESS")) {
           return { type: "pending" };
         }
-        const response = await hostRequest({
-          url: probeUrl,
-          cookies,
-          headers: JSON_HEADERS,
-        });
-        if (response.status < 200 || response.status >= 300) {
-          fail("Remote", "The website rejected the sign-in check");
-        }
-        const root = parseJsonObject(response.body);
-        const data = asObject(root?.data);
-        if (!data || !isLoggedIn(data.is_login)) return { type: "pending" };
-        const uid = text(data.uid);
-        if (!/^\d+$/.test(uid)) return { type: "pending" };
-        const handle = text(data.name).trim() || uid;
-        const displayName = text(data.name_show).trim() || handle;
+        const profile = await verifiedAccount(context.origin, cookies);
+        if (!profile) return { type: "pending" };
         return {
           type: "success",
           value: {
-            accountId: uid,
+            accountId: profile.key.id,
             origin: context.origin,
             credential: { cookies },
-            profile: {
-              key: { id: uid, host: accountHost(context) },
-              handle,
-              displayName,
-              avatarUrl: avatarUrl(text(data.portrait_url)),
-            },
-            capabilities: {
-              [TIMELINE_CAPABILITY]: ["page"],
-              [TAB_CATALOG_CAPABILITY]: ["page"],
-              [POST_CAPABILITY]: ["detail", "context"],
-            },
+            profile,
+            capabilities: CAPABILITIES,
           },
         };
       },
@@ -99,550 +76,682 @@ defineFlareSocialPlugin({
   capabilities: {
     timeline: {
       async page(request, context) {
-        if (request.page.direction === "newer") {
-          fail("Unsupported", "This timeline does not support newer pages");
-        }
-        if (request.timelineId === "hot") {
-          return loadHot(request.page, context);
-        }
-        const parameters = { ...request.page.parameters, ...request.parameters };
-        const forum = text(parameters.kw).trim();
-        if (!forum) fail("Unsupported", "This timeline does not identify a forum");
-        return loadForum(forum, request.page, context);
+        const { timelineId, page } = request;
+        if (timelineId === "hot") return pageRows(await hotTopics(context), page);
+        if (timelineId === "recommend") return loadRecommendations(page, context);
+        const forum = text(request.parameters.kw || page.parameters.kw || timelineId.match(/^forum:(.+)$/)?.[1]).trim();
+        if (!forum) fail("Unsupported", "找不到此时间线对应的贴吧");
+        return loadForum(forum, page, context);
       },
     },
-    tabCatalog: {
-      async page(_request, context) {
-        const data = await requestData(
-          "/mg/o/getForumHome?st=0&pn=0&rn=50&eqid=&refer=",
-          context,
-        );
-        const sections: TimelineSectionV1[] = [];
-        const liked = forumDescriptors(asObject(data.like_forum)?.list);
-        if (liked.length) {
-          sections.push({
-            id: "liked",
-            title: { value: "我关注的吧" },
-            timelines: { items: liked, endReached: true },
-          });
+    tabCatalog: { page: loadCatalog },
+    search: {
+      posts: loadPostSearch,
+      async profiles({ query, page }, context) {
+        if (!query.trim()) return { items: [], endReached: true };
+        const { batch, skip } = pagePosition(page);
+        const { users, hasMore } = await searchUsers(query.trim(), batch, context);
+        return pageRows(users, page, { batch, skip }, hasMore);
+      },
+      discoverPosts: ({ page }, context) => loadRecommendations(page, context),
+      async discoverProfiles({ page }, context) {
+        const { batch, skip } = pagePosition(page);
+        const { items, hasMore } = await recommendedPosts(batch, context);
+        const profiles = new Map<string, ProfileV1>();
+        for (const { post } of items) {
+          if (post.author) profiles.set(post.author.key.id, post.author);
         }
-        const recommended = forumDescriptors(data.recomm_forum);
-        if (recommended.length) {
-          sections.push({
-            id: "recommended",
-            title: { value: "推荐吧" },
-            timelines: { items: recommended, endReached: true },
-          });
+        return pageRows([...profiles.values()], page, { batch, skip }, hasMore);
+      },
+      async discoverHashtags({ page }, context) {
+        const topics = await hotTopics(context);
+        return pageRows(topics.map(({ feed }) => ({ name: feed.title ?? "", url: feed.url })), page);
+      },
+    },
+    profile: {
+      async byId(request, context) {
+        const id = request.key.id;
+        if (context.accountId === id) {
+          const profile = await verifiedAccount(context.origin, await readCookies(context));
+          if (profile?.key.id === id) return profile;
+          fail("AuthenticationRequired", "贴吧登录已失效，请重新登录");
         }
-        return { items: sections, endReached: true };
+        return findProfile(id, context);
+      },
+      async byHandle({ handle }, context) {
+        return findProfile(handle, context);
       },
     },
     post: {
       async detail(request, context) {
-        const id = request.key.id;
-        const tid = threadIdOf(id);
-        if (!tid) fail("NotFound", "The requested thread does not exist");
-        if (id.startsWith("p")) {
-          const pid = id.slice(id.indexOf("_") + 1);
-          for (let page = 1; page <= 4; page += 1) {
-            const floors = parseThreadPage(
-              await requestHtml(threadPagePath(tid, page), context),
-            );
-            const floor = floors.find((item) => item.pid === pid);
-            if (floor) return { post: mapFloor(floor, tid, context, true) };
-            if (!floors.length) break;
-          }
-          fail("NotFound", "The requested reply does not exist");
+        const ref = postRef(request.key.id);
+        if (!ref) fail("NotFound", "找不到这篇帖子");
+        if (ref.pid && ref.parent) {
+          const page = await loadSubfloors(ref.tid, ref.parent.pid, ref.offset ?? 0, context);
+          const floor = page.floors.find(({ pid }) => pid === ref.pid);
+          if (floor) return { post: mapFloor(floor, ref.tid, request.key.id, ref.parent) };
+          fail("NotFound", "找不到这条楼中楼回复");
         }
-        const floors = parseThreadPage(
-          await requestHtml(threadPagePath(tid, 1), context),
-        );
-        const first = floors[0];
-        if (!first) fail("NotFound", "The requested thread does not exist");
-        return { post: mapThreadDetail(first, tid, context) };
+        let offset = ref.offset ?? 0;
+        for (let attempt = 0; attempt < 4; attempt++) {
+          const page = await loadFloors(ref.tid, offset, context);
+          const floor = ref.pid
+            ? page.floors.find(({ pid }) => pid === ref.pid)
+            : page.floors.find(({ index }) => index === 1);
+          if (floor) {
+            const post = mapFloor(floor, ref.tid, request.key.id, undefined, page.forum);
+            if (!ref.pid) post.repliesCount = page.repliesCount;
+            if (floor.media.some(({ type }) => type === "image" || type === "gif")) {
+              const originals = await loadOriginalImages(ref.tid, floor.pid, context).catch(() => []);
+              if (originals.length) {
+                post.media = [...originals, ...floor.media.filter(({ type }) => type === "video")];
+              }
+            }
+            return { post };
+          }
+          // Existing reply keys did not carry the offset.
+          if (!ref.pid || ref.offset !== undefined || page.nextOffset === undefined) break;
+          offset = page.nextOffset;
+        }
+        fail("NotFound", "找不到这条帖子或回复");
       },
       async context(request, context) {
-        const tid = threadIdOf(request.key.id);
-        if (!tid) fail("NotFound", "The requested thread does not exist");
-        const page =
-          request.page.direction === "refresh"
-            ? 1
-            : parsePositiveInt(request.page.cursor);
-        if (page === null || page > MAX_THREAD_PAGES) {
-          fail("Validation", "Invalid page cursor");
-        }
-        const floors = parseThreadPage(
-          await requestHtml(threadPagePath(tid, page), context),
-        );
-        if (!floors.length) return { items: [], endReached: true };
-        const visible = page === 1 ? floors.slice(1) : floors;
-        const items: TimelineItemV1[] = visible
-          .slice(0, request.page.limit)
-          .map((floor) => ({
-            type: "post" as const,
-            post: mapFloor(floor, tid, context, false),
-          }));
-        return {
-          items,
-          olderCursor: String(page + 1),
-          endReached: false,
-        };
+        const ref = postRef(request.key.id);
+        if (!ref) fail("NotFound", "找不到这篇帖子");
+        if (ref.parent) return { items: [], endReached: true };
+        const page = request.page;
+        const { batch, skip } = pagePosition(page, 0);
+        const parent = ref.pid ? { pid: ref.pid, key: request.key.id, offset: ref.offset ?? 0 } : undefined;
+        const loaded = ref.pid
+          ? await loadSubfloors(ref.tid, ref.pid, batch, context)
+          : await loadFloors(ref.tid, batch, context);
+        const floors = loaded.floors.filter(({ index }) => ref.pid || index !== 1);
+        const items = floors.map((floor) => ({
+          type: "post" as const,
+          post: mapFloor(floor, ref.tid, replyKey(ref.tid, floor.pid, batch, parent), parent),
+        }));
+        return pageRows(items, page, { batch, skip }, loaded.nextOffset !== undefined, loaded.nextOffset);
       },
     },
   },
 });
 
-async function loadHot(
-  page: PageRequestV1,
-  context: PluginInvocationContextV1,
-): Promise<PageV1<TimelineItemV1>> {
-  if (page.direction !== "refresh") return { items: [], endReached: true };
-  const data = await requestData("/mo/q/hotMessage/list?fr=newwise", context);
-  const list = asObject(data.list);
-  const entries = list && Array.isArray(list.ret) ? list.ret : [];
-  const items: TimelineItemV1[] = [];
-  for (const entry of entries) {
-    const item = mapHotTopic(entry);
-    if (item) items.push(item);
-    if (items.length >= page.limit) break;
-  }
-  return { items, endReached: true };
-}
-
-async function loadForum(
-  forum: string,
-  page: PageRequestV1,
-  context: PluginInvocationContextV1,
-): Promise<PageV1<TimelineItemV1>> {
-  const start = page.direction === "refresh" ? 0 : parsePositiveInt(page.cursor);
-  if (start === null || page.cursor === undefined || page.cursor === "") {
-    if (page.direction !== "refresh") fail("Validation", "Invalid page cursor");
-  }
-  const offset = start === null ? 0 : start;
-  const pageNumber = Math.floor(offset / THREADS_PER_PAGE);
-  const offsetInPage = offset % THREADS_PER_PAGE;
-  const data = await requestData(
-    "/f?kw=" +
-      encodeURIComponent(forum) +
-      "&pn=" +
-      String(pageNumber * THREADS_PER_PAGE) +
-      "&fr=newwise",
-    context,
-  );
-  const frs = asObject(data.frs_data);
-  if (!frs) fail("InvalidResponse", "The forum response was incomplete");
-  const threads = Array.isArray(frs.thread_list) ? frs.thread_list : [];
-  if (!threads.length) return { items: [], endReached: true };
-  const info = asObject(frs.page) ?? {};
-  const currentPage = numberOr(info.current_page, pageNumber + 1);
-  const totalPage = numberOr(info.total_page, currentPage);
-  const slice = threads.slice(offsetInPage, offsetInPage + page.limit);
-  const items: TimelineItemV1[] = [];
-  for (const thread of slice) {
-    const item = mapThread(thread, context);
-    if (item) items.push(item);
-  }
-  const nextOffset = offset + slice.length;
-  const endReached =
-    currentPage >= totalPage && offsetInPage + slice.length >= threads.length;
-  return {
-    items,
-    olderCursor: endReached || !slice.length ? undefined : String(nextOffset),
-    endReached,
-  };
-}
-
-function mapHotTopic(value: unknown): TimelineItemV1 | undefined {
-  const entry = asObject(value);
-  if (!entry) return undefined;
-  const id = text(entry.re_id).trim();
-  const title = text(entry.mul_name).trim();
-  if (!id || !title) return undefined;
-  const info = asObject(entry.topic_info) ?? {};
-  const createdAt = isoFromEpoch(entry.create_time) ?? new Date().toISOString();
-  const picture = text(info.head_pic);
-  return {
-    type: "feed",
-    feed: {
-      url:
-        "https://tieba.baidu.com/mo/q/hotMessage?topic_id=" +
-        encodeURIComponent(id) +
-        "&topic_name=" +
-        encodeURIComponent(title),
-      createdAt,
-      source: { name: "贴吧热议" },
-      title,
-      description: {
-        format: "plain",
-        value: text(entry.share_sub_title) || text(info.topic_desc),
-      },
-      media: picture
-        ? { id: "hot-" + id, type: "image", url: normalizeUrl(picture) }
-        : undefined,
-    },
-  };
-}
-
-function mapThread(
-  value: unknown,
-  context: PluginInvocationContextV1,
-): TimelineItemV1 | undefined {
-  const thread = asObject(value);
-  if (!thread) return undefined;
-  const tid = text(thread.tid) || text(thread.id);
-  if (!/^\d+$/.test(tid)) return undefined;
-  const media = mapThreadMedia(thread, tid);
-  const post: PostV1 = {
-    key: { id: "t" + tid, host: accountHost(context) },
-    author: mapUser(thread.author, context),
-    createdAt:
-      isoFromEpoch(thread.create_time) ??
-      isoFromEpoch(thread.last_time_int) ??
-      new Date().toISOString(),
-    content: threadContent(thread),
-    media,
-    detailType: "post",
-    url: threadUrl(tid),
-    repliesCount: numberOrUndefined(thread.reply_num),
-  };
-  return { type: "post", post };
-}
-
-function mapThreadDetail(
-  floor: ThreadFloor,
-  tid: string,
-  context: PluginInvocationContextV1,
-): PostV1 {
-  const title = floor.title
-    ? "<b>" + escapeHtml(floor.title) + "</b><br/>"
-    : "";
-  return {
-    key: { id: "t" + tid, host: accountHost(context) },
-    author: floorAuthor(floor, context),
-    createdAt: parseTiebaTime(floor.timeText) ?? new Date().toISOString(),
-    content: { format: "html", value: title + floor.contentHtml || " " },
-    media: floorMedia(floor),
-    detailType: "post",
-    url: threadUrl(tid),
-  };
-}
-
-function mapFloor(
-  floor: ThreadFloor,
-  tid: string,
-  context: PluginInvocationContextV1,
-  internal: boolean,
-): PostV1 {
-  return {
-    key: { id: "p" + tid + "_" + floor.pid, host: accountHost(context) },
-    author: floorAuthor(floor, context),
-    createdAt: parseTiebaTime(floor.timeText) ?? new Date().toISOString(),
-    content: { format: "html", value: floor.contentHtml || " " },
-    media: floorMedia(floor),
-    detailType: internal ? "post" : "link",
-    url: threadUrl(tid) + "?pid=" + encodeURIComponent(floor.pid),
-  };
-}
-
-function threadContent(thread: JsonObject): RichTextV1 {
-  const title = text(thread.title).trim();
-  const summary = text(thread.abstract).trim();
-  const parts: string[] = [];
-  if (title) parts.push("<b>" + escapeHtml(title) + "</b>");
-  if (summary) parts.push(escapeHtml(summary).replace(/\n/g, "<br/>"));
-  return { format: "html", value: parts.join("<br/>") || " " };
-}
-
-function mapThreadMedia(thread: JsonObject, tid: string): MediaV1[] | undefined {
-  const list = Array.isArray(thread.media) ? thread.media : [];
-  const media: MediaV1[] = [];
-  for (const value of list) {
-    const item = asObject(value);
-    if (!item || text(item.type) !== "pic") continue;
-    const url =
-      text(item.static_img) ||
-      text(item.water_pic) ||
-      text(item.big_pic) ||
-      text(item.src_pic);
-    if (!url) continue;
-    const preview = text(item.small_pic) || text(item.water_pic);
-    media.push({
-      id: tid + "-m" + String(media.length),
-      type: "image",
-      url: normalizeUrl(url),
-      previewUrl: preview ? normalizeUrl(preview) : undefined,
-    });
-    if (media.length >= 9) break;
-  }
-  return media.length ? media : undefined;
-}
-
-function mapUser(
-  value: unknown,
-  context: PluginInvocationContextV1,
-): ProfileV1 | undefined {
-  const user = asObject(value);
-  if (!user) return undefined;
-  const name = text(user.name).trim();
-  const id = text(user.id).trim() || name;
-  if (!id) return undefined;
-  return {
-    key: { id, host: accountHost(context) },
-    handle: name || id,
-    displayName: text(user.name_show).trim() || name || id,
-    avatarUrl: avatarUrl(text(user.portrait)),
-  };
-}
-
-function floorAuthor(
-  floor: ThreadFloor,
-  context: PluginInvocationContextV1,
-): ProfileV1 {
-  const id = floor.userName || floor.pid;
-  return {
-    key: { id, host: accountHost(context) },
-    handle: floor.userName || id,
-    displayName: floor.displayName || floor.userName || id,
-    avatarUrl: avatarUrl(floor.portrait),
-  };
-}
-
-function floorMedia(floor: ThreadFloor): MediaV1[] | undefined {
-  const urls: string[] = [];
-  const pattern = /<img\b[^>]*\bsrc=["']([^"']+)["']/gi;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(floor.contentHtml)) !== null) {
-    const url = normalizeUrl(decodeEntities(match[1]));
-    if (!/^https:\/\/[^/]+\.(?:baidu|bdimg|bdstatic)\.com\//i.test(url)) continue;
-    if (/\/tb\/editor\//i.test(url)) continue;
-    if (!urls.includes(url)) urls.push(url);
-    if (urls.length >= 9) break;
-  }
-  return urls.length
-    ? urls.map((url, index) => ({
-        id: floor.pid + "-" + String(index),
-        type: "image" as const,
-        url,
-      }))
+async function verifiedAccount(origin: string, cookies: TiebaCookie[]): Promise<ProfileV1 | undefined> {
+  const response = await hostRequest(origin + ACCOUNT_PATH, cookies);
+  if ([401, 403].includes(response.status)) return undefined;
+  requireStatus(response);
+  const data = asObject(parseJsonObject(response.body)?.data);
+  if (!data) return undefined;
+  const user = asObject(data.user) ?? asObject(data.user_info) ?? data;
+  if (!isTrue(data.is_login ?? user.is_login)) return undefined;
+  const id = numericId(user.uid || user.id || user.user_id || data.uid);
+  if (id && id !== "0") return mapUser(user, id);
+  const catalog = await hostRequest(origin + CATALOG_PATH, cookies);
+  if (catalog.status !== 200) return undefined;
+  const profile = asObject(asObject(parseJsonObject(catalog.body)?.data)?.user_info);
+  const catalogId = numericId(profile?.id);
+  return isTrue(profile?.is_login) && catalogId && catalogId !== "0"
+    ? mapUser({ ...user, ...profile }, catalogId)
     : undefined;
 }
 
-function forumDescriptors(value: unknown): TimelineDescriptorV1[] {
-  const list = Array.isArray(value) ? value : [];
+async function loadCatalog(page: PageRequestV1, context: PluginInvocationContextV1): Promise<PageV1<TimelineSectionV1>> {
+  if (page.direction !== "refresh") return { items: [], endReached: true };
+  const data = await requestData(CATALOG_PATH, context);
+  const liked = asObject(data.like_forum);
   const seen = new Set<string>();
-  const descriptors: TimelineDescriptorV1[] = [];
-  for (const entry of list) {
-    const forum = asObject(entry);
-    if (!forum) continue;
-    const name = text(forum.forum_name).trim();
-    if (!name || seen.has(name)) continue;
-    seen.add(name);
-    descriptors.push({
-      id: "forum:" + name,
-      title: { value: name },
-      icon: "List",
-      parameters: { kw: name },
-    });
+  const sections: TimelineSectionV1[] = [];
+  for (const [id, title, forums] of [
+    ["liked", { key: "catalog.followed", fallback: "Followed forums" }, asArray(liked?.list ?? data.like_forum)],
+    ["recommended", { key: "catalog.recommended", fallback: "Recommended forums" }, asArray(data.recomm_forum)],
+  ] as const) {
+    const items: TimelineDescriptorV1[] = [];
+    for (const value of forums) {
+      const forum = asObject(value);
+      const name = text(forum?.forum_name ?? forum?.name).trim();
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      items.push({ id: "forum:" + name, title: { value: name + "吧" }, icon: "List", parameters: { kw: name } });
+    }
+    if (items.length) sections.push({ id, title, timelines: { items, endReached: true } });
   }
-  return descriptors;
+  return { items: sections, endReached: true };
 }
 
-function parseThreadPage(html: string): ThreadFloor[] {
-  const floors: ThreadFloor[] = [];
-  const pattern = /<li\b([^>]*\bj_post_list_item\b[^>]*)>([\s\S]*?)<\/li>/g;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(html)) !== null) {
-    const attributes = match[1];
-    const body = match[2];
-    const rawInfo = /\bdata-info="([^"]*)"/.exec(attributes);
-    if (!rawInfo) continue;
-    let info: JsonObject;
-    try {
-      const parsed: unknown = JSON.parse(decodeEntities(rawInfo[1]));
-      const object = asObject(parsed);
-      if (!object) continue;
-      info = object;
-    } catch {
-      continue;
+async function hotTopics(context: PluginInvocationContextV1): Promise<{ type: "feed"; feed: FeedV1 }[]> {
+  const data = await requestData("/hottopic/browse/topicList", context);
+  const entries = asArray(asObject(data.bang_topic)?.topic_list);
+  return entries.flatMap((value) => {
+    const topic = asObject(value);
+    const id = numericId(topic?.topic_id);
+    const title = text(topic?.topic_name).trim();
+    if (!topic || !id || !title) return [];
+    const url = TIEBA_ORIGIN + "/hottopic/browse/hottopic?topic_id=" + id + "&topic_name=" + encodeURIComponent(title);
+    const picture = httpsUrl(text(topic.topic_pic));
+    const summary = text(topic.topic_desc ?? topic.abstract);
+    return [{
+      type: "feed",
+      feed: {
+        url,
+        title,
+        createdAt: postTime(topic.create_time),
+        source: { name: "贴吧热议" },
+        description: summary ? { format: "plain", value: summary } : undefined,
+        media: picture ? { id: "hot-" + id, type: "image", url: picture } : undefined,
+        sourceLanguages: LANGUAGE,
+      },
+    }];
+  });
+}
+
+async function recommendedPosts(batch: number, context: PluginInvocationContextV1) {
+  const data = await requestData("/mo/q/recommend?pn=" + batch, context);
+  const rows = [...asArray(data.hot_thread_list), ...asArray(data.video_thread_list)];
+  return { items: mapThreads(rows), hasMore: rows.length > 0 };
+}
+
+async function loadRecommendations(page: PageRequestV1, context: PluginInvocationContextV1): Promise<PageV1<TimelineItemV1>> {
+  const position = pagePosition(page);
+  const { items, hasMore } = await recommendedPosts(position.batch, context);
+  return pageRows(items, page, position, hasMore);
+}
+
+async function loadForum(forum: string, page: PageRequestV1, context: PluginInvocationContextV1): Promise<PageV1<TimelineItemV1>> {
+  const position = pagePosition(page, 0);
+  const path = "/mo/q/frs?kw=" + encodeURIComponent(forum) + "&pn=" + position.batch;
+  const response = await requestSite(path, context, true);
+  const html = response.body;
+  const list = inlineJson(html, /\bthread_list:\s*(?=\[)/);
+  if (!Array.isArray(list)) {
+    if (/本吧暂不开放|该吧不存在|此吧不存在/.test(html)) fail("NotFound", "这个贴吧暂不可用");
+    fail("InvalidResponse", "贴吧没有返回帖子列表");
+  }
+  const info = asObject(inlineJson(html, /\bpage:\s*(?=\{"req_num":)/));
+  const size = positiveInt(info?.page_size) ?? 30;
+  const offset = numberOrUndefined(info?.offset) ?? position.batch;
+  const next = offset + size;
+  const hasMore = list.length > 0 && next < (positiveInt(info?.total_page) ?? 1) * size && next > position.batch;
+  return pageRows(mapThreads(list, forum), page, position, hasMore, next);
+}
+
+async function loadPostSearch({ query, page }: SearchRequestV1, context: PluginInvocationContextV1): Promise<PageV1<TimelineItemV1>> {
+  const word = query.trim();
+  if (!word) return { items: [], endReached: true };
+  const position = pagePosition(page);
+  const suffix = "?word=" + encodeURIComponent(word) + "&pn=" + position.batch;
+  const data = await requestData("/mo/q/search/thread" + suffix, context);
+  const posts: TimelineItemV1[] = mapThreads(asArray(data.post_list));
+  if (position.batch === 1) {
+    // The search surface has no forum entity. Put an exact forum match above the posts.
+    const forums = await requestData("/mo/q/search/forum" + suffix, context).catch(() => undefined);
+    const forum = asObject(forums?.exactMatch);
+    const name = text(forum?.forum_name);
+    if (name) {
+      const image = httpsUrl(text(forum?.avatar));
+      posts.unshift({
+        type: "feed",
+        feed: {
+          url: TIEBA_ORIGIN + "/mo/q/frs?kw=" + encodeURIComponent(name),
+          title: name + "吧",
+          description: { format: "plain", value: text(forum?.intro ?? forum?.slogan) },
+          createdAt: postTime(),
+          source: { name: "百度贴吧" },
+          media: image ? { id: "forum-" + name, type: "image", url: image } : undefined,
+          sourceLanguages: LANGUAGE,
+        },
+      });
     }
-    const pid = text(info.pid).trim();
+  }
+  return pageRows(posts, page, position, isTrue(data.has_more));
+}
+
+async function searchUsers(query: string, batch: number, context: PluginInvocationContextV1) {
+  const data = await requestData("/mo/q/search/user?word=" + encodeURIComponent(query) + "&pn=" + batch, context);
+  const unique = new Map<string, ProfileV1>();
+  for (const value of [data.exactMatch, ...asArray(data.fuzzyMatch)]) {
+    const user = mapUser(value);
+    if (user) unique.set(user.key.id, user);
+  }
+  return { users: [...unique.values()], hasMore: isTrue(data.has_more) };
+}
+
+async function findProfile(handle: string, context: PluginInvocationContextV1): Promise<ProfileV1> {
+  const { users } = await searchUsers(handle, 1, context);
+  const profile = users.find((user) => user.key.id === handle || user.handle === handle);
+  if (!profile) fail("NotFound", "找不到这位吧友");
+  return profile;
+}
+
+function mapThreads(rows: unknown[], forum?: string): { type: "post"; post: PostV1 }[] {
+  const posts = new Map<string, PostV1>();
+  for (const value of rows) {
+    const thread = asObject(value);
+    const tid = numericId(thread?.tid ?? thread?.id);
+    if (!thread || !tid || posts.has(tid)) continue;
+    const title = text(thread.title ?? thread.thread_title).trim();
+    const summary = text(thread.abstract ?? thread.thread_abstract ?? thread.content).trim();
+    const media = threadMedia(thread, tid);
+    const parts = [title && "<b>" + escapeHtml(title) + "</b>", summary && escapeHtml(summary).replace(/\n/g, "<br>")];
+    posts.set(tid, {
+      key: key(tid),
+      author: mapUser(thread.author ?? thread.user ?? thread),
+      createdAt: postTime(thread.create_time ?? thread.time ?? thread.last_time_int),
+      content: { format: "html", value: parts.filter(Boolean).join("<br>") || " " },
+      detailType: "post",
+      url: threadUrl(tid),
+      media,
+      repliesCount: numberOrUndefined(thread.reply_num ?? thread.post_num),
+      favouritesCount: numberOrUndefined(thread.agree_num ?? thread.like_num),
+      sourceChannel: forumChannel(forum ?? text(thread.forum_name), thread.forum_id),
+      sourceLanguages: LANGUAGE,
+    });
+  }
+  return [...posts.values()].map((post) => ({ type: "post", post }));
+}
+
+function threadMedia(thread: JsonObject, tid: string): MediaV1[] {
+  const media: MediaV1[] = [];
+  for (const value of asArray(thread.media)) {
+    const item = asObject(value);
+    if (!item || text(item.type) !== "pic") continue;
+    const url = httpsUrl(text(item.big_pic || item.src_pic || item.water_pic || item.static_img));
+    if (!url || media.some((image) => image.url === url)) continue;
+    media.push({
+      id: tid + "-m" + media.length,
+      type: /\.gif(?:[?#]|$)/i.test(url) ? "gif" : "image",
+      url,
+      previewUrl: httpsUrl(text(item.water_pic || item.small_pic)),
+      width: positiveInt(item.width),
+      height: positiveInt(item.height),
+    });
+  }
+  const video = asObject(thread.video_info) ?? asObject(asArray(thread.video_info)[0]);
+  const videoUrl = httpsUrl(text(video?.video_url || video?.play_url || thread.video_url));
+  if (videoUrl) {
+    media.unshift({
+      id: tid + "-video",
+      type: "video",
+      url: videoUrl,
+      previewUrl: httpsUrl(text(video?.thumbnail_url || video?.cover_url || thread.pic_url)),
+      width: positiveInt(video?.width ?? thread.video_width),
+      height: positiveInt(video?.height ?? thread.video_height),
+    });
+  }
+  const picture = httpsUrl(text(thread.pic_url));
+  if (!media.length && picture) media.push({ id: tid + "-m0", type: "image", url: picture });
+  return media.slice(0, 9);
+}
+
+function mapUser(value: unknown, accountId?: string): ProfileV1 | undefined {
+  const user = asObject(value);
+  if (!user) return undefined;
+  const name = text(user.user_name ?? user.name ?? user.un).trim();
+  const display = text(user.show_nickname || user.name_show || user.name_nickname || user.user_nickname).trim();
+  const id = accountId ?? name;
+  if (!id) return undefined;
+  return {
+    key: key(id),
+    handle: name || id,
+    displayName: display || name || id,
+    avatarUrl: avatarUrl(text(user.portrait_url || user.portrait)),
+    description: text(user.intro) ? { format: "plain", value: text(user.intro) } : undefined,
+    followersCount: numberOrUndefined(user.fans_num),
+    url: name ? TIEBA_ORIGIN + "/home/main?un=" + encodeURIComponent(name) : undefined,
+  };
+}
+
+async function loadFloors(tid: string, offset: number, context: PluginInvocationContextV1) {
+  const path = "/mo/q/pb?kz=" + tid + "&pn=" + (offset || 1);
+  if (offset === 0) {
+    const html = (await requestSite(path, context, true)).body;
+    const floors = parseFloors(html);
+    if (!floors.length) fail("NotFound", "这篇帖子已删除、受限或暂时无法查看");
+    const info = asObject(inlineJson(html, /\bpage:\s*(?=\{"req_num":)/));
+    const forum = text(inlineJson(html, /\bforum_name:\s*(?=")/));
+    const thread = asObject(inlineJson(html, /\bthreadInfo:\s*(?=\{)/));
+    return { floors, nextOffset: nextFloorOffset(info, offset), forum, repliesCount: numberOrUndefined(thread?.reply_num) };
+  }
+  const data = await requestData(path + "&is_ajax=1", context);
+  return { floors: parseFloors(text(data.html)), nextOffset: nextFloorOffset(asObject(data.page), offset), forum: "", repliesCount: undefined };
+}
+
+async function loadSubfloors(tid: string, parent: string, offset: number, context: PluginInvocationContextV1) {
+  const data = await requestData("/mo/q/flr?kz=" + tid + "&pid=" + parent + "&pnum=" + (offset || 1), context);
+  const info = asObject(data.page);
+  const current = positiveInt(info?.current_page) ?? 1;
+  const total = positiveInt(info?.total_page) ?? 1;
+  return {
+    floors: parseFloors(text(data.floor_html), true),
+    nextOffset: current < total && current + 1 > offset ? current + 1 : undefined,
+  };
+}
+
+async function loadOriginalImages(tid: string, pid: string, context: PluginInvocationContextV1): Promise<MediaV1[]> {
+  const data = await requestData("/photo/bw/picture/guide?tid=" + tid, context);
+  return Object.values(asObject(data.pic_list) ?? {}).flatMap((value) => {
+    const picture = asObject(value);
+    if (numericId(picture?.post_id) !== pid) return [];
+    const image = asObject(picture?.img);
+    const original = asObject(image?.original);
+    const url = httpsUrl(text(original?.waterurl || original?.url));
+    if (!url) return [];
+    return [{
+      id: pid + "-m" + text(picture?.index),
+      type: /\.gif(?:[?#]|$)/i.test(url) ? "gif" as const : "image" as const,
+      url,
+      previewUrl: httpsUrl(text(asObject(image?.medium)?.url)),
+      width: positiveInt(original?.width),
+      height: positiveInt(original?.height),
+    }];
+  }).slice(0, 9);
+}
+
+function nextFloorOffset(page: JsonObject | undefined, requested: number): number | undefined {
+  const current = positiveInt(page?.current_page) ?? 1;
+  const total = positiveInt(page?.total_page) ?? 1;
+  const next = current * (positiveInt(page?.page_size) ?? 30);
+  return current < total && next > requested ? next : undefined;
+}
+
+function parseFloors(html: string, nested = false): Floor[] {
+  const className = nested ? "j_list_item_floor" : "j_post_list_item";
+  const starts = [...html.matchAll(/<li\b[^>]*>/gi)].filter((match) =>
+    attribute(match[0], "class").split(/\s+/).includes(className));
+  const floors: Floor[] = [];
+  for (const [index, start] of starts.entries()) {
+    const body = html.slice(start.index + start[0].length, starts[index + 1]?.index);
+    const info = parseJsonObject(attribute(start[0], "data-info"));
+    const pid = numericId(info?.pid ?? attribute(start[0], nested ? "pid" : "tid"));
     if (!pid) continue;
-    const tidMatch = /\bdata-tid="(\d+)"/.exec(attributes);
-    const contentMatch = /<div class="content"[^>]*>([\s\S]*?)<\/div>/.exec(body);
-    const titleMatch = /<div class="post_title_embed">([\s\S]*?)<\/div>/.exec(body);
-    const timeMatch = /<span class="list_item_time">([^<]*)<\/span>/.exec(body);
+    const content = classContent(body, nested ? "span" : "div", nested ? "floor_content" : "content");
+    const media = floorMedia(content, pid);
+    const author = mapUser({
+      name: info?.un,
+      name_show: info?.name_show ?? (nested ? stripTags(classContent(body, "a", "user_name")).trim().replace(/[:：]$/, "") : undefined),
+      portrait: info?.portrait,
+    });
     floors.push({
-      tid: tidMatch ? tidMatch[1] : "",
       pid,
-      floor: numberOr(info.floor_num, 1),
-      userName: text(info.un).trim(),
-      displayName: text(info.name_show).trim(),
-      portrait: text(info.portrait).trim(),
-      contentHtml: contentMatch ? normalizeContentHtml(contentMatch[1]) : "",
-      title: titleMatch ? stripTags(titleMatch[1]).trim() : "",
-      timeText: timeMatch ? timeMatch[1].trim() : "",
+      index: positiveInt(info?.floor_num ?? attribute(start[0], "fn")) ?? 0,
+      author,
+      title: stripTags(classContent(body, "div", "post_title_embed")).trim(),
+      content: displayFloorContent(content),
+      time: stripTags(classContent(body, "span", "list_item_time")).trim(),
+      media,
+      repliesCount: nested ? undefined : numberOrUndefined(attribute(classTag(body, "div", "j_floor_panel")?.[0] ?? "", "data-list-count")),
     });
   }
   return floors;
 }
 
-function normalizeContentHtml(html: string): string {
-  let out = html
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<style[\s\S]*?<\/style>/gi, "");
-  out = out
-    .replace(/\son\w+\s*=\s*"[^"]*"/gi, "")
-    .replace(/\son\w+\s*=\s*'[^']*'/gi, "");
-  out = out.replace(/https?:\/\/[^"'\s<>]+/gi, (url) => normalizeUrl(url));
-  return out.trim();
+function mapFloor(floor: Floor, tid: string, id: string, parent?: ParentFloor, forum?: string): PostV1 {
+  const thread = !postRef(id)?.pid;
+  const title = thread && floor.title ? "<b>" + escapeHtml(floor.title) + "</b><br>" : "";
+  return {
+    key: key(id),
+    author: floor.author,
+    createdAt: parseTiebaTime(floor.time) ?? postTime(),
+    content: { format: "html", value: (title + floor.content).trim() || " " },
+    media: floor.media,
+    detailType: "post",
+    url: thread ? threadUrl(tid) : threadUrl(tid) + "?pid=" + (parent?.pid ?? floor.pid) + "#" + floor.pid,
+    replyTo: thread ? undefined : key(parent?.key ?? tid),
+    repliesCount: floor.repliesCount,
+    sourceChannel: forumChannel(forum ?? ""),
+    sourceLanguages: LANGUAGE,
+  };
 }
 
-function normalizeUrl(value: string): string {
-  let url = decodeEntities(value).trim();
-  if (url.startsWith("//")) url = "https:" + url;
-  url = url.replace(/^http:\/\//i, "https://");
-  url = url.replace(
-    /^https:\/\/[a-z0-9-]+\.hiphotos\.baidu\.com\//i,
-    "https://imgsrc.baidu.com/",
-  );
-  url = url.replace(/^https:\/\/tb\.himg\.baidu\.com\//i, "https://himg.bdimg.com/");
-  return url;
+function floorMedia(html: string, pid: string): MediaV1[] {
+  const items: MediaV1[] = [];
+  const signedVideo = classTag(html, "span", "net_search_url");
+  const videoUrl = httpsUrl(attribute(signedVideo?.[0] ?? "", "data-vhsrc"));
+  if (videoUrl) {
+    const preview = /<a\b[^>]*\bdata-vhsrc=[^>]*>[\s\S]*?<\/a>/i.exec(html);
+    const poster = preview?.[0].match(/<img\b[^>]*>/i)?.[0] ?? "";
+    items.push({ id: pid + "-video", type: "video", url: videoUrl, previewUrl: httpsUrl(attribute(poster, "src")) });
+    if (preview) html = html.replace(preview[0], "");
+  }
+  for (const match of html.matchAll(/<(?:img|div|video|source)\b[^>]*>/gi)) {
+    const tag = match[0];
+    const embedded = attribute(tag, "data-url");
+    const url = httpsUrl(attribute(tag, "data-original") || embedded || attribute(tag, "src"));
+    if (!url || /\/tb\/(?:editor|cms\/nickemoji)\//i.test(url) || items.some((item) => item.url === url)) continue;
+    const isVideo = /^<(?:video|source)\b/i.test(tag);
+    items.push({
+      id: pid + "-m" + items.length,
+      type: isVideo ? "video" : /\.gif(?:[?#]|$)/i.test(url) ? "gif" : "image",
+      url,
+      previewUrl: isVideo ? httpsUrl(attribute(tag, "poster")) : undefined,
+      description: attribute(tag, "alt") || undefined,
+      width: positiveInt(attribute(tag, "width")),
+      height: positiveInt(attribute(tag, "height")),
+    });
+    if (items.length === 9) break;
+  }
+  return items;
 }
 
-function avatarUrl(portrait: string): string | undefined {
-  const value = portrait.trim();
-  if (!value) return undefined;
-  if (/^https?:\/\//i.test(value)) return normalizeUrl(value);
-  return "https://himg.bdimg.com/sys/portrait/item/" + value;
+function displayFloorContent(html: string): string {
+  // Render regular photos in Flare's native media gallery. Keep small inline emoji in the text.
+  return html
+    .replace(/<(script|style|video)\b[^>]*>[\s\S]*?<\/\1>/gi, "")
+    .replace(/<a\b[^>]*\bdata-vhsrc=[^>]*>[\s\S]*?<\/a>/gi, "")
+    .replace(/<div\b[^>]*class=["'][^"']*\bj_videoFootDownBtn\b[^"']*["'][^>]*>[\s\S]*?<\/div>/gi, "")
+    .replace(/<div\b[^>]*class=["'][^"']*\bpb_less_imgs\b[^"']*["'][^>]*>[\s\S]*$/i, "")
+    .replace(/<img\b[^>]*>/gi, (tag) => {
+      const src = httpsUrl(attribute(tag, "src"));
+      if (src && /\/tb\/editor\//i.test(src)) return '<img src="' + escapeHtml(src) + '" alt="' + escapeHtml(attribute(tag, "alt")) + '">';
+      return "";
+    })
+    .replace(/\son\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+    .replace(/\bhref=(["'])(\/[^/"'][^"']*)\1/gi, (_link, quote: string, path: string) => "href=" + quote + TIEBA_ORIGIN + path + quote)
+    .trim();
+}
+
+function classTag(html: string, tag: string, name: string) {
+  return [...html.matchAll(new RegExp("<" + tag + "\\b[^>]*>", "gi"))].find((match) =>
+    attribute(match[0], "class").split(/\s+/).includes(name));
+}
+
+function classContent(html: string, tag: string, name: string): string {
+  const start = classTag(html, tag, name);
+  if (!start) return "";
+  const offset = start.index + start[0].length;
+  const tags = new RegExp("<(/?)" + tag + "\\b[^>]*>", "gi");
+  tags.lastIndex = offset;
+  let depth = 1;
+  for (let match = tags.exec(html); match; match = tags.exec(html)) {
+    depth += match[1] ? -1 : 1;
+    if (depth === 0) return html.slice(offset, match.index);
+  }
+  return "";
+}
+
+function attribute(tag: string, name: string): string {
+  const value = new RegExp("(?:^|\\s)" + name + "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))", "i").exec(tag);
+  return value ? decodeEntities(value[1] ?? value[2] ?? value[3]) : "";
+}
+
+function inlineJson(html: string, marker: RegExp): unknown {
+  const match = marker.exec(html);
+  if (!match) return undefined;
+  const start = match.index + match[0].length;
+  const tokens = /"(?:[^"\\]|\\[\s\S])*"|[\[\]{}]/g;
+  tokens.lastIndex = start;
+  let depth = 0;
+  for (let token = tokens.exec(html); token; token = tokens.exec(html)) {
+    if (token[0] === "{" || token[0] === "[") depth++;
+    if (token[0] === "}" || token[0] === "]") depth--;
+    if (depth === 0) {
+      try { return JSON.parse(html.slice(start, tokens.lastIndex)); }
+      catch { return undefined; }
+    }
+  }
+  return undefined;
+}
+
+function pagePosition(page: PageRequestV1, first = 1): { batch: number; skip: number } {
+  if (page.direction === "refresh") return { batch: first, skip: 0 };
+  const match = /^(\d+)(?::(\d+))?$/.exec(page.cursor ?? "");
+  const batch = Number(match?.[1]);
+  const skip = Number(match?.[2] ?? 0);
+  if (page.direction !== "older" || !Number.isSafeInteger(batch) || !Number.isSafeInteger(skip)) {
+    fail("Validation", "分页位置无效，请刷新后重试");
+  }
+  return { batch, skip };
+}
+
+function pageRows<T>(
+  rows: T[],
+  page: PageRequestV1,
+  position = pagePosition(page),
+  hasMore = false,
+  nextBatch = position.batch + 1,
+): PageV1<T> {
+  const items = rows.slice(position.skip, position.skip + page.limit);
+  const end = position.skip + items.length;
+  const olderCursor = end < rows.length
+    ? position.batch + ":" + end
+    : hasMore ? String(nextBatch) : undefined;
+  return { items, olderCursor, endReached: olderCursor === undefined };
+}
+
+type ParentFloor = { pid: string; key: string; offset: number };
+
+function postRef(id: string): { tid: string; pid?: string; offset?: number; parent?: ParentFloor } | undefined {
+  const thread = /^t?(\d+)$/.exec(id);
+  if (thread) return { tid: thread[1] };
+  const reply = /^p(\d+)_(\d+)(?:_(\d+)(?:_(\d+)_(\d+))?)?$/.exec(id);
+  if (!reply) return undefined;
+  const [, tid, pid, offset, parent, parentOffset] = reply;
+  const parentPage = Number(parentOffset);
+  return {
+    tid,
+    pid,
+    offset: numberOrUndefined(offset),
+    parent: parent ? { pid: parent, offset: parentPage, key: replyKey(tid, parent, parentPage) } : undefined,
+  };
+}
+
+function replyKey(tid: string, pid: string, offset: number, parent?: ParentFloor): string {
+  return "p" + tid + "_" + pid + "_" + offset + (parent ? "_" + parent.pid + "_" + parent.offset : "");
+}
+
+function key(id: string): EntityKeyV1 {
+  return { id, host: TIEBA_HOST };
 }
 
 function threadUrl(tid: string): string {
-  return "https://tieba.baidu.com/p/" + tid;
+  return TIEBA_ORIGIN + "/p/" + tid;
 }
 
-function threadPagePath(tid: string, page: number): string {
-  return "/mo/q/m?kz=" + tid + "&pn=" + String(page);
+function forumChannel(name: string, id?: unknown): PostV1["sourceChannel"] {
+  return name ? { id: numericId(id) ?? name, name: name + "吧" } : undefined;
 }
 
-function threadIdOf(id: string): string | null {
-  if (id.startsWith("t")) {
-    const tid = id.slice(1);
-    return /^\d+$/.test(tid) ? tid : null;
-  }
-  const match = /^p(\d+)_\d+$/.exec(id);
-  return match ? match[1] : null;
+function httpsUrl(value: string): string | undefined {
+  const url = decodeEntities(value).trim()
+    .replace(/^\/\//, "https://")
+    .replace(/^http:\/\//i, "https://")
+    .replace(/^https:\/\/[a-z0-9-]+\.hiphotos\.baidu\.com\//i, "https://imgsrc.baidu.com/")
+    .replace(/^https:\/\/tb\.himg\.baidu\.com\//i, "https://himg.bdimg.com/");
+  return /^https:\/\/[a-z0-9.-]+(?::\d+)?(?:[/?#]|$)/i.test(url) && !/[\s<>"']/.test(url) ? url : undefined;
 }
 
-async function requestData(
-  path: string,
-  context: PluginInvocationContextV1,
-): Promise<JsonObject> {
-  const cookies = await readCookies();
-  const response = await hostRequest({
-    url: context.origin + path,
-    cookies,
-    headers: JSON_HEADERS,
-  });
-  if (response.status === 403) {
-    fail("Remote", "百度安全验证拦截了请求，请重新登录");
-  }
-  if (response.status < 200 || response.status >= 300) {
-    fail("Remote", "The website returned an error");
-  }
+function avatarUrl(portrait: string): string | undefined {
+  return httpsUrl(portrait) ?? (/^[\w.-]+(?:\?t=\d+)?$/.test(portrait) ? "https://himg.bdimg.com/sys/portrait/item/" + portrait : undefined);
+}
+
+async function requestSite(path: string, context: PluginInvocationContextV1, html = false): Promise<HttpResponseV1> {
+  const response = await hostRequest(context.origin + path, await readCookies(context), html);
+  requireStatus(response);
+  return response;
+}
+
+async function requestData(path: string, context: PluginInvocationContextV1): Promise<JsonObject> {
+  const response = await requestSite(path, context);
   const root = parseJsonObject(response.body);
-  if (!root) fail("InvalidResponse", "The website did not return JSON");
+  if (!root) fail("InvalidResponse", "贴吧返回了无法读取的页面");
   const code = root.no ?? root.errno;
   if (code !== undefined && Number(code) !== 0) {
-    const message = text(root.error) || text(root.errmsg);
-    if (/logined|登录/i.test(message)) {
-      fail("AuthenticationRequired", "Sign in again");
-    }
-    fail("Remote", message || "The website rejected the request");
+    const message = text(root.error || root.errmsg);
+    if (/not logined|未登录|没有登录|请登录/i.test(message)) fail("AuthenticationRequired", "请登录贴吧后重试");
+    fail("Remote", message || "贴吧接口暂不可用");
   }
   const data = asObject(root.data);
-  if (!data) fail("InvalidResponse", "The website response was incomplete");
+  if (!data) fail("InvalidResponse", "贴吧返回的数据不完整");
   return data;
 }
 
-async function requestHtml(
-  path: string,
-  context: PluginInvocationContextV1,
-): Promise<string> {
-  const cookies = await readCookies();
-  const response = await hostRequest({
-    url: context.origin + path,
-    cookies,
-  });
-  if (response.status === 403) {
-    fail("Remote", "百度安全验证拦截了请求，请重新登录");
-  }
-  if (response.status < 200 || response.status >= 300) {
-    fail("Remote", "The website returned an error");
-  }
-  return response.body;
-}
-
-async function readCookies(): Promise<TiebaCookie[]> {
-  const value = await flare.credential.read();
-  const stored = asObject(value);
-  const list = stored && Array.isArray(stored.cookies) ? stored.cookies : [];
-  const cookies: TiebaCookie[] = [];
-  for (const entry of list) {
+async function readCookies(context: PluginInvocationContextV1): Promise<TiebaCookie[]> {
+  if (context.scope !== "account" || !context.credentialAvailable) return [];
+  const credential = asObject(await flare.credential.read());
+  return asArray(credential?.cookies).flatMap((entry) => {
     const cookie = asObject(entry);
-    if (!cookie) continue;
-    const name = text(cookie.name);
-    const content = text(cookie.value);
-    if (name && content) cookies.push({ name, value: content });
-  }
-  if (!hasCookie(cookies, "BDUSS")) {
-    fail("AuthenticationRequired", "Sign in again");
-  }
-  return cookies;
+    const name = text(cookie?.name);
+    const value = text(cookie?.value);
+    return name && value ? [{ name, value }] : [];
+  });
 }
 
-async function hostRequest(request: HttpRequestV1): Promise<HttpResponseV1> {
+async function hostRequest(url: string, cookies: TiebaCookie[], html = false): Promise<HttpResponseV1> {
   try {
-    return await flare.http.request(request);
+    return await flare.http.request({
+      url,
+      cookies,
+      headers: html ? { ...JSON_HEADERS, Accept: "text/html,application/xhtml+xml,*/*;q=0.8" } : JSON_HEADERS,
+    });
   } catch (error) {
-    if (error && typeof error === "object" && "code" in error) {
-      const code = (error as { code?: unknown }).code;
-      if (code === "host.unavailable") {
-        fail("Network", "The request could not be completed");
-      }
-    }
+    if (asObject(error)?.code === "host.unavailable") fail("Network", "暂时无法连接贴吧");
     throw error;
   }
 }
 
+function requireStatus(response: HttpResponseV1) {
+  if (response.status === 401) fail("AuthenticationRequired", "请重新登录贴吧");
+  if (response.status === 403) fail("Remote", "百度安全验证拦截了请求，请稍后重试");
+  if (response.status === 404) fail("NotFound", "贴吧页面不存在");
+  if (response.status === 429) fail("RateLimited", "贴吧请求过于频繁，请稍后重试");
+  if (response.status < 200 || response.status >= 300) fail("Remote", "贴吧暂时无法返回数据");
+}
+
 function parseJsonObject(body: string): JsonObject | undefined {
-  try {
-    const parsed: unknown = JSON.parse(body);
-    return asObject(parsed);
-  } catch {
-    return undefined;
-  }
-}
-
-function hasCookie(cookies: TiebaCookie[], name: string): boolean {
-  return cookies.some((cookie) => cookie.name === name && cookie.value.length > 0);
-}
-
-function isLoggedIn(value: unknown): boolean {
-  return value === true || value === 1 || value === "1" || value === "true";
+  try { return asObject(JSON.parse(body)); }
+  catch { return undefined; }
 }
 
 function asObject(value: unknown): JsonObject | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as JsonObject)
-    : undefined;
+  return value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : undefined;
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
 }
 
 function text(value: unknown): string {
   if (typeof value === "string") return value;
-  if (typeof value === "number") return String(value);
-  return "";
+  return typeof value === "number" ? String(value) : "";
 }
 
+function numericId(value: unknown): string | undefined {
+  if (typeof value === "number" && !Number.isSafeInteger(value)) return undefined;
+  const id = text(value);
+  return /^\d+$/.test(id) ? id : undefined;
+}
+
+function positiveInt(value: unknown): number | undefined {
+  const number = numberOrUndefined(value);
+  return number && number > 0 ? number : undefined;
+}
+
+function isTrue(value: unknown): boolean {
+  return value === true || value === 1 || value === "1" || value === "true";
+}
+
+function postTime(value?: unknown): string {
+  return isoFromEpoch(value) ?? new Date().toISOString();
+}
 function numberOrUndefined(value: unknown): number | undefined {
   const parsed =
     typeof value === "number"
@@ -653,16 +762,6 @@ function numberOrUndefined(value: unknown): number | undefined {
   return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : undefined;
 }
 
-function numberOr(value: unknown, fallback: number): number {
-  return numberOrUndefined(value) ?? fallback;
-}
-
-function parsePositiveInt(value: string | undefined): number | null {
-  if (!value || !/^\d+$/.test(value)) return null;
-  const parsed = Number(value);
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
-}
-
 function isoFromEpoch(value: unknown): string | undefined {
   const parsed =
     typeof value === "number"
@@ -670,8 +769,8 @@ function isoFromEpoch(value: unknown): string | undefined {
       : typeof value === "string" && /^\d+$/.test(value)
         ? Number(value)
         : NaN;
-  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
-  return new Date(parsed * 1000).toISOString();
+  const date = new Date(parsed * 1000);
+  return parsed > 0 && Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
 }
 
 function parseTiebaTime(value: string): string | undefined {
@@ -765,10 +864,6 @@ function escapeHtml(value: string): string {
 
 function stripTags(value: string): string {
   return decodeEntities(value.replace(/<[^>]*>/g, ""));
-}
-
-function accountHost(context: PluginInvocationContextV1): string {
-  return context.origin.slice("https://".length);
 }
 
 function fail(code: PluginErrorCodeV1, message: string): never {

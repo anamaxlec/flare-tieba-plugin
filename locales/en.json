@@ -1,7 +1,10 @@
 {
   "plugin.name": "Tieba",
-  "plugin.description": "Baidu Tieba forums, threads and replies",
+  "plugin.description": "Read Baidu Tieba forums, threads and replies in Flare",
   "platform.name": "Tieba",
   "login.browser.title": "Sign in with browser",
-  "timeline.hot.title": "Hot topics"
+  "timeline.hot.title": "Hot topics",
+  "timeline.recommend.title": "Recommended posts",
+  "catalog.followed": "Followed forums",
+  "catalog.recommended": "Recommended forums"
 }
