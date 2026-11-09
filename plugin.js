@@ -1,11 +1,163 @@
 "use strict";
 (() => {
+  // src/md5.ts
+  function md5Ascii(value) {
+    const message = Uint8Array.from(value, (char) => char.charCodeAt(0));
+    const bitLengthLow = message.length << 3 >>> 0;
+    const bitLengthHigh = Math.floor(message.length / 536870912) >>> 0;
+    const paddedLength = (Math.floor((message.length + 8) / 64) + 1) * 64;
+    const padded = new Uint8Array(paddedLength);
+    padded.set(message);
+    padded[message.length] = 128;
+    for (let index = 0; index < 4; index += 1) {
+      padded[paddedLength - 8 + index] = bitLengthLow >>> 8 * index & 255;
+      padded[paddedLength - 4 + index] = bitLengthHigh >>> 8 * index & 255;
+    }
+    let a0 = 1732584193;
+    let b0 = 4023233417;
+    let c0 = 2562383102;
+    let d0 = 271733878;
+    const words = new Array(16);
+    for (let offset = 0; offset < padded.length; offset += 64) {
+      for (let index = 0; index < 16; index += 1) {
+        const wordOffset = offset + index * 4;
+        words[index] = padded[wordOffset] | padded[wordOffset + 1] << 8 | padded[wordOffset + 2] << 16 | padded[wordOffset + 3] << 24;
+      }
+      let a = a0;
+      let b = b0;
+      let c = c0;
+      let d = d0;
+      for (let index = 0; index < 64; index += 1) {
+        let f;
+        let g;
+        if (index < 16) {
+          f = b & c | ~b & d;
+          g = index;
+        } else if (index < 32) {
+          f = d & b | ~d & c;
+          g = (5 * index + 1) % 16;
+        } else if (index < 48) {
+          f = b ^ c ^ d;
+          g = (3 * index + 5) % 16;
+        } else {
+          f = c ^ (b | ~d);
+          g = 7 * index % 16;
+        }
+        const nextD = c;
+        c = b;
+        b = b + rotateLeft(a + f + MD5_K[index] + words[g] >>> 0, MD5_S[index]) >>> 0;
+        a = d;
+        d = nextD;
+      }
+      a0 = a0 + a >>> 0;
+      b0 = b0 + b >>> 0;
+      c0 = c0 + c >>> 0;
+      d0 = d0 + d >>> 0;
+    }
+    return littleEndianHex(a0) + littleEndianHex(b0) + littleEndianHex(c0) + littleEndianHex(d0);
+  }
+  var MD5_S = [
+    7,
+    12,
+    17,
+    22,
+    7,
+    12,
+    17,
+    22,
+    7,
+    12,
+    17,
+    22,
+    7,
+    12,
+    17,
+    22,
+    5,
+    9,
+    14,
+    20,
+    5,
+    9,
+    14,
+    20,
+    5,
+    9,
+    14,
+    20,
+    5,
+    9,
+    14,
+    20,
+    4,
+    11,
+    16,
+    23,
+    4,
+    11,
+    16,
+    23,
+    4,
+    11,
+    16,
+    23,
+    4,
+    11,
+    16,
+    23,
+    6,
+    10,
+    15,
+    21,
+    6,
+    10,
+    15,
+    21,
+    6,
+    10,
+    15,
+    21,
+    6,
+    10,
+    15,
+    21
+  ];
+  var MD5_K = (() => {
+    const table = new Array(64);
+    for (let index = 0; index < 64; index += 1) {
+      table[index] = Math.floor(
+        Math.abs(Math.sin(index + 1)) * 4294967296
+      ) >>> 0;
+    }
+    return table;
+  })();
+  function littleEndianHex(value) {
+    const bytes = [
+      value & 255,
+      value >>> 8 & 255,
+      value >>> 16 & 255,
+      value >>> 24 & 255
+    ];
+    let output = "";
+    for (const byte of bytes) {
+      output += HEX[byte >>> 4] + HEX[byte & 15];
+    }
+    return output;
+  }
+  var HEX = "0123456789abcdef";
+  function rotateLeft(value, bits) {
+    return value << bits | value >>> 32 - bits;
+  }
+
   // src/plugin.ts
   var TIEBA_HOST = "tieba.baidu.com";
   var TIEBA_ORIGIN = "https://" + TIEBA_HOST;
   var LOGIN_URL = "https://wappass.baidu.com/passport/?login&tpl=tb&u=https%3A%2F%2Ftieba.baidu.com%2Fmo%2Fq%2Ffrs%3Fkw%3D%25E6%2595%25B0%25E7%25A0%2581";
   var ACCOUNT_PATH = "/mo/q/newmoindex?need_user=1";
   var CATALOG_PATH = "/mg/o/getForumHome?st=0&pn=0&rn=50&eqid=&refer=";
+  var FORUM_GUIDE_PATH = "/c/f/forum/forumGuide";
+  var FOLLOWED_PAGE_SIZE = 100;
+  var PC_FORUM_SIGN_SALT = "36770b1f34c9bbf2e7d1a99d2b82fa9e";
   var LANGUAGE = ["zh-CN"];
   var JSON_HEADERS = {
     Accept: "application/json, text/plain, */*",
@@ -109,49 +261,41 @@
         }
       },
       post: {
-        async detail(request, context) {
-          const ref = postRef(request.key.id);
-          if (!ref) fail("NotFound", "\u627E\u4E0D\u5230\u8FD9\u7BC7\u5E16\u5B50");
-          if (ref.pid && ref.parent) {
-            const page = await loadSubfloors(ref.tid, ref.parent.pid, ref.offset ?? 0, context);
-            const floor = page.floors.find(({ pid }) => pid === ref.pid);
-            if (floor) return { post: mapFloor(floor, ref.tid, request.key.id, ref.parent) };
-            fail("NotFound", "\u627E\u4E0D\u5230\u8FD9\u6761\u697C\u4E2D\u697C\u56DE\u590D");
-          }
-          let offset = ref.offset ?? 0;
-          for (let attempt = 0; attempt < 4; attempt++) {
-            const page = await loadFloors(ref.tid, offset, context);
-            const floor = ref.pid ? page.floors.find(({ pid }) => pid === ref.pid) : page.floors.find(({ index }) => index === 1);
-            if (floor) {
-              const post = mapFloor(floor, ref.tid, request.key.id, void 0, page.forum);
-              if (!ref.pid) post.repliesCount = page.repliesCount;
-              if (floor.media.some(({ type }) => type === "image" || type === "gif")) {
-                const originals = await loadOriginalImages(ref.tid, floor.pid, context).catch(() => []);
-                if (originals.length) {
-                  post.media = [...originals, ...floor.media.filter(({ type }) => type === "video")];
-                }
-              }
-              return { post };
-            }
-            if (!ref.pid || ref.offset !== void 0 || page.nextOffset === void 0) break;
-            offset = page.nextOffset;
-          }
-          fail("NotFound", "\u627E\u4E0D\u5230\u8FD9\u6761\u5E16\u5B50\u6216\u56DE\u590D");
+        async detail({ key: { id } }, context) {
+          return { post: await loadPostDetail(id, context) };
         },
         async context(request, context) {
-          const ref = postRef(request.key.id);
+          const id = request.key.id;
+          const ref = postRef(id);
           if (!ref) fail("NotFound", "\u627E\u4E0D\u5230\u8FD9\u7BC7\u5E16\u5B50");
-          if (ref.parent) return { items: [], endReached: true };
           const page = request.page;
           const { batch, skip } = pagePosition(page, 0);
-          const parent = ref.pid ? { pid: ref.pid, key: request.key.id, offset: ref.offset ?? 0 } : void 0;
-          const loaded = ref.pid ? await loadSubfloors(ref.tid, ref.pid, batch, context) : await loadFloors(ref.tid, batch, context);
-          const floors = loaded.floors.filter(({ index }) => ref.pid || index !== 1);
-          const items = floors.map((floor) => ({
+          const refresh = page.direction === "refresh";
+          if (ref.parent) {
+            const items2 = refresh ? [{ type: "post", post: await loadPostDetail(id, context) }] : [];
+            return { items: items2, endReached: true };
+          }
+          const parent = ref.pid ? { pid: ref.pid, key: id, offset: ref.offset ?? 0 } : void 0;
+          const loaded = await (parent ? loadSubfloors(ref.tid, parent.pid, batch, context) : loadFloors(ref.tid, batch, context));
+          const items = loaded.floors.filter(({ index }) => parent || index !== 1).map((floor) => ({
             type: "post",
-            post: mapFloor(floor, ref.tid, replyKey(ref.tid, floor.pid, batch, parent), parent)
+            post: {
+              ...mapFloor(floor, ref.tid, replyKey(ref.tid, floor.pid, batch, parent), parent),
+              replyTo: request.key
+            }
           }));
-          return pageRows(items, page, { batch, skip }, loaded.nextOffset !== void 0, loaded.nextOffset);
+          const result = pageRows(
+            items,
+            { ...page, limit: page.limit - Number(refresh) },
+            { batch, skip },
+            loaded.nextOffset !== void 0,
+            loaded.nextOffset
+          );
+          if (refresh) {
+            const post = parent ? await loadPostDetail(id, context) : await mapMainPost(firstFloor(loaded.floors), ref.tid, id, loaded.forum ?? "", loaded.repliesCount, context);
+            result.items?.unshift({ type: "post", post });
+          }
+          return result;
         }
       }
     }
@@ -173,14 +317,70 @@
     return isTrue(profile?.is_login) && catalogId && catalogId !== "0" ? mapUser({ ...user, ...profile }, catalogId) : void 0;
   }
   async function loadCatalog(page, context) {
+    const cookies = await readCookies(context);
+    if (page.direction === "older") {
+      const next = /^followed:(\d+)$/.exec(page.cursor ?? "");
+      const batch = positiveInt(next?.[1]);
+      if (!batch || !cookies.length) fail("Validation", "\u5173\u6CE8\u5427\u7684\u5206\u9875\u4F4D\u7F6E\u65E0\u6548");
+      const followed = await loadFollowedPage(batch, context, cookies);
+      return forumCatalog(followed.rows, [], followed.next);
+    }
     if (page.direction !== "refresh") return { items: [], endReached: true };
     const data = await requestData(CATALOG_PATH, context);
-    const liked = asObject(data.like_forum);
+    const recommended = asArray(data.recomm_forum);
+    if (!cookies.length) return forumCatalog([], recommended);
+    const homeFollowed = asArray(asObject(data.like_forum)?.list ?? data.like_forum);
+    const guide = await loadForumGuide(context, cookies).catch(() => void 0);
+    const completeGuide = guide && guide.rows.length < 200 && !guide.hasMore && guide.rows.length >= homeFollowed.length;
+    if (completeGuide) return forumCatalog(guide.rows, recommended);
+    const paged = await loadFollowedPage(1, context, cookies).catch(() => void 0);
+    if (paged && (paged.rows.length || paged.next)) return forumCatalog(paged.rows, recommended, paged.next);
+    return forumCatalog(guide?.rows.length ? guide.rows : homeFollowed, recommended);
+  }
+  async function loadForumGuide(context, cookies) {
+    const response = await hostRequest(context.origin + FORUM_GUIDE_PATH, cookies, false, {
+      method: "POST",
+      headers: { "Subapp-Type": "hybrid" },
+      body: { type: "form", values: { sort_type: "3", call_from: "3" } }
+    });
+    requireStatus(response);
+    const root = parseJsonObject(response.body);
+    if (Number(root?.error_code) !== 0 || !Array.isArray(root?.like_forum)) {
+      fail("InvalidResponse", "\u8D34\u5427\u6CA1\u6709\u8FD4\u56DE\u5173\u6CE8\u5427\u5217\u8868");
+    }
+    return { rows: root.like_forum, hasMore: isTrue(root.like_forum_has_more) };
+  }
+  async function loadFollowedPage(batch, context, cookies) {
+    const profile = await verifiedAccount(context.origin, cookies);
+    const portrait = profile?.avatarUrl?.match(/\/([\w.-]+)(?:[?#]|$)/)?.[1];
+    if (!profile || profile.key.id !== context.accountId || !portrait) {
+      fail("AuthenticationRequired", "\u8BF7\u767B\u5F55\u8D34\u5427\u540E\u67E5\u770B\u5B8C\u6574\u5173\u6CE8\u5217\u8868");
+    }
+    const query = {
+      _client_type: "20",
+      pn: String(batch),
+      portrait,
+      rn: String(FOLLOWED_PAGE_SIZE),
+      subapp_type: "pc"
+    };
+    const parts = Object.entries(query).map(([name, value]) => name + "=" + value);
+    const sign = md5Ascii(parts.join("") + PC_FORUM_SIGN_SALT);
+    const response = await hostRequest(context.origin + "/c/f/pc/myForumList?" + parts.join("&") + "&sign=" + sign, cookies);
+    requireStatus(response);
+    const root = parseJsonObject(response.body);
+    const data = asObject(root?.data);
+    if (Number(root?.error_code) !== 0 || !data || !Array.isArray(data.like)) {
+      fail("InvalidResponse", "\u8D34\u5427\u6CA1\u6709\u8FD4\u56DE\u5173\u6CE8\u5427\u7684\u5206\u9875\u6570\u636E");
+    }
+    const rows = data.like;
+    return { rows, next: rows.length && isTrue(data.has_more) ? "followed:" + (batch + 1) : void 0 };
+  }
+  function forumCatalog(followed, recommended, cursor) {
     const seen = /* @__PURE__ */ new Set();
     const sections = [];
     for (const [id, title, forums] of [
-      ["liked", { key: "catalog.followed", fallback: "Followed forums" }, asArray(liked?.list ?? data.like_forum)],
-      ["recommended", { key: "catalog.recommended", fallback: "Recommended forums" }, asArray(data.recomm_forum)]
+      ["liked", { key: "catalog.followed", fallback: "Followed forums" }, followed],
+      ["recommended", { key: "catalog.recommended", fallback: "Recommended forums" }, recommended]
     ]) {
       const items = [];
       for (const value of forums) {
@@ -198,7 +398,7 @@
       }
       if (items.length) sections.push({ id, title, timelines: { items, endReached: true } });
     }
-    return { items: sections, endReached: true };
+    return { items: sections, olderCursor: cursor, endReached: cursor === void 0 };
   }
   async function hotTopics(context) {
     const data = await requestData("/hottopic/browse/topicList", context);
@@ -370,6 +570,39 @@
       followersCount: numberOrUndefined(user.fans_num),
       url: name ? TIEBA_ORIGIN + "/home/main?un=" + encodeURIComponent(name) : void 0
     };
+  }
+  async function loadPostDetail(id, context) {
+    const ref = postRef(id);
+    if (!ref) fail("NotFound", "\u627E\u4E0D\u5230\u8FD9\u7BC7\u5E16\u5B50");
+    if (ref.pid && ref.parent) {
+      const page = await loadSubfloors(ref.tid, ref.parent.pid, ref.offset ?? 0, context);
+      const floor = page.floors.find(({ pid }) => pid === ref.pid);
+      if (floor) return mapFloor(floor, ref.tid, id, ref.parent);
+      fail("NotFound", "\u627E\u4E0D\u5230\u8FD9\u6761\u697C\u4E2D\u697C\u56DE\u590D");
+    }
+    let offset = ref.offset ?? 0;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const page = await loadFloors(ref.tid, offset, context);
+      const floor = ref.pid ? page.floors.find(({ pid }) => pid === ref.pid) : firstFloor(page.floors);
+      if (floor) return mapMainPost(floor, ref.tid, id, page.forum ?? "", ref.pid ? void 0 : page.repliesCount, context);
+      if (ref.offset !== void 0 || page.nextOffset === void 0) break;
+      offset = page.nextOffset;
+    }
+    fail("NotFound", "\u627E\u4E0D\u5230\u8FD9\u6761\u5E16\u5B50\u6216\u56DE\u590D");
+  }
+  function firstFloor(floors) {
+    const floor = floors.find(({ index }) => index === 1);
+    if (!floor) fail("NotFound", "\u697C\u4E3B\u7684\u6B63\u6587\u6682\u4E0D\u53EF\u7528");
+    return floor;
+  }
+  async function mapMainPost(floor, tid, id, forum, repliesCount, context) {
+    const post = mapFloor(floor, tid, id, void 0, forum);
+    if (repliesCount !== void 0) post.repliesCount = repliesCount;
+    if (floor.media.some(({ type }) => type === "image" || type === "gif")) {
+      const originals = await loadOriginalImages(tid, floor.pid, context).catch(() => []);
+      if (originals.length) post.media = [...originals, ...floor.media.filter(({ type }) => type === "video")];
+    }
+    return post;
   }
   async function loadFloors(tid, offset, context) {
     const path = "/mo/q/pb?kz=" + tid + "&pn=" + (offset || 1);
@@ -620,12 +853,17 @@
       return name && value ? [{ name, value }] : [];
     });
   }
-  async function hostRequest(url, cookies, html = false) {
+  async function hostRequest(url, cookies, html = false, options) {
     try {
       return await flare.http.request({
+        ...options,
         url,
         cookies,
-        headers: html ? { ...JSON_HEADERS, Accept: "text/html,application/xhtml+xml,*/*;q=0.8" } : JSON_HEADERS
+        headers: {
+          ...JSON_HEADERS,
+          ...html ? { Accept: "text/html,application/xhtml+xml,*/*;q=0.8" } : {},
+          ...options?.headers
+        }
       });
     } catch (error) {
       if (asObject(error)?.code === "host.unavailable") fail("Network", "\u6682\u65F6\u65E0\u6CD5\u8FDE\u63A5\u8D34\u5427");

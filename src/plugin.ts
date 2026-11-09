@@ -1,8 +1,13 @@
+import { md5Ascii } from "./md5";
+
 const TIEBA_HOST = "tieba.baidu.com";
 const TIEBA_ORIGIN = "https://" + TIEBA_HOST;
 const LOGIN_URL = "https://wappass.baidu.com/passport/?login&tpl=tb&u=https%3A%2F%2Ftieba.baidu.com%2Fmo%2Fq%2Ffrs%3Fkw%3D%25E6%2595%25B0%25E7%25A0%2581";
 const ACCOUNT_PATH = "/mo/q/newmoindex?need_user=1";
 const CATALOG_PATH = "/mg/o/getForumHome?st=0&pn=0&rn=50&eqid=&refer=";
+const FORUM_GUIDE_PATH = "/c/f/forum/forumGuide";
+const FOLLOWED_PAGE_SIZE = 100;
+const PC_FORUM_SIGN_SALT = "36770b1f34c9bbf2e7d1a99d2b82fa9e";
 const LANGUAGE = ["zh-CN"];
 const JSON_HEADERS = {
   Accept: "application/json, text/plain, */*",
@@ -22,6 +27,8 @@ const CAPABILITIES = {
 
 type JsonObject = Record<string, unknown>;
 type TiebaCookie = { name: string; value: string };
+type FloorPage = { floors: Floor[]; nextOffset?: number; forum?: string; repliesCount?: number };
+
 type Floor = {
   pid: string;
   index: number;
@@ -123,54 +130,39 @@ defineFlareSocialPlugin({
       },
     },
     post: {
-      async detail(request, context) {
-        const ref = postRef(request.key.id);
-        if (!ref) fail("NotFound", "找不到这篇帖子");
-        if (ref.pid && ref.parent) {
-          const page = await loadSubfloors(ref.tid, ref.parent.pid, ref.offset ?? 0, context);
-          const floor = page.floors.find(({ pid }) => pid === ref.pid);
-          if (floor) return { post: mapFloor(floor, ref.tid, request.key.id, ref.parent) };
-          fail("NotFound", "找不到这条楼中楼回复");
-        }
-        let offset = ref.offset ?? 0;
-        for (let attempt = 0; attempt < 4; attempt++) {
-          const page = await loadFloors(ref.tid, offset, context);
-          const floor = ref.pid
-            ? page.floors.find(({ pid }) => pid === ref.pid)
-            : page.floors.find(({ index }) => index === 1);
-          if (floor) {
-            const post = mapFloor(floor, ref.tid, request.key.id, undefined, page.forum);
-            if (!ref.pid) post.repliesCount = page.repliesCount;
-            if (floor.media.some(({ type }) => type === "image" || type === "gif")) {
-              const originals = await loadOriginalImages(ref.tid, floor.pid, context).catch(() => []);
-              if (originals.length) {
-                post.media = [...originals, ...floor.media.filter(({ type }) => type === "video")];
-              }
-            }
-            return { post };
-          }
-          // Existing reply keys did not carry the offset.
-          if (!ref.pid || ref.offset !== undefined || page.nextOffset === undefined) break;
-          offset = page.nextOffset;
-        }
-        fail("NotFound", "找不到这条帖子或回复");
+      async detail({ key: { id } }, context) {
+        return { post: await loadPostDetail(id, context) };
       },
       async context(request, context) {
-        const ref = postRef(request.key.id);
+        const id = request.key.id;
+        const ref = postRef(id);
         if (!ref) fail("NotFound", "找不到这篇帖子");
-        if (ref.parent) return { items: [], endReached: true };
         const page = request.page;
         const { batch, skip } = pagePosition(page, 0);
-        const parent = ref.pid ? { pid: ref.pid, key: request.key.id, offset: ref.offset ?? 0 } : undefined;
-        const loaded = ref.pid
-          ? await loadSubfloors(ref.tid, ref.pid, batch, context)
-          : await loadFloors(ref.tid, batch, context);
-        const floors = loaded.floors.filter(({ index }) => ref.pid || index !== 1);
-        const items = floors.map((floor) => ({
+        const refresh = page.direction === "refresh";
+        if (ref.parent) {
+          const items = refresh ? [{ type: "post" as const, post: await loadPostDetail(id, context) }] : [];
+          return { items, endReached: true };
+        }
+        const parent = ref.pid ? { pid: ref.pid, key: id, offset: ref.offset ?? 0 } : undefined;
+        const loaded = await (parent ? loadSubfloors(ref.tid, parent.pid, batch, context) : loadFloors(ref.tid, batch, context));
+        const items: TimelineItemV1[] = loaded.floors.filter(({ index }) => parent || index !== 1).map((floor) => ({
           type: "post" as const,
-          post: mapFloor(floor, ref.tid, replyKey(ref.tid, floor.pid, batch, parent), parent),
+          post: {
+            ...mapFloor(floor, ref.tid, replyKey(ref.tid, floor.pid, batch, parent), parent),
+            replyTo: request.key,
+          },
         }));
-        return pageRows(items, page, { batch, skip }, loaded.nextOffset !== undefined, loaded.nextOffset);
+        const result = pageRows(items, { ...page, limit: page.limit - Number(refresh) },
+          { batch, skip }, loaded.nextOffset !== undefined, loaded.nextOffset);
+        if (refresh) {
+          // Flare renders context rows directly, including the selected post at the top.
+          const post = parent
+            ? await loadPostDetail(id, context)
+            : await mapMainPost(firstFloor(loaded.floors), ref.tid, id, loaded.forum ?? "", loaded.repliesCount, context);
+          result.items?.unshift({ type: "post", post });
+        }
+        return result;
       },
     },
   },
@@ -196,14 +188,77 @@ async function verifiedAccount(origin: string, cookies: TiebaCookie[]): Promise<
 }
 
 async function loadCatalog(page: PageRequestV1, context: PluginInvocationContextV1): Promise<PageV1<TimelineSectionV1>> {
+  const cookies = await readCookies(context);
+  if (page.direction === "older") {
+    const next = /^followed:(\d+)$/.exec(page.cursor ?? "");
+    const batch = positiveInt(next?.[1]);
+    if (!batch || !cookies.length) fail("Validation", "关注吧的分页位置无效");
+    const followed = await loadFollowedPage(batch, context, cookies);
+    return forumCatalog(followed.rows, [], followed.next);
+  }
   if (page.direction !== "refresh") return { items: [], endReached: true };
+
   const data = await requestData(CATALOG_PATH, context);
-  const liked = asObject(data.like_forum);
+  const recommended = asArray(data.recomm_forum);
+  if (!cookies.length) return forumCatalog([], recommended);
+
+  const homeFollowed = asArray(asObject(data.like_forum)?.list ?? data.like_forum);
+  const guide = await loadForumGuide(context, cookies).catch(() => undefined);
+  const completeGuide = guide && guide.rows.length < 200 && !guide.hasMore && guide.rows.length >= homeFollowed.length;
+  if (completeGuide) return forumCatalog(guide.rows, recommended);
+
+  const paged = await loadFollowedPage(1, context, cookies).catch(() => undefined);
+  if (paged && (paged.rows.length || paged.next)) return forumCatalog(paged.rows, recommended, paged.next);
+  return forumCatalog(guide?.rows.length ? guide.rows : homeFollowed, recommended);
+}
+
+async function loadForumGuide(context: PluginInvocationContextV1, cookies: TiebaCookie[]) {
+  const response = await hostRequest(context.origin + FORUM_GUIDE_PATH, cookies, false, {
+    method: "POST",
+    headers: { "Subapp-Type": "hybrid" },
+    body: { type: "form", values: { sort_type: "3", call_from: "3" } },
+  });
+  requireStatus(response);
+  const root = parseJsonObject(response.body);
+  if (Number(root?.error_code) !== 0 || !Array.isArray(root?.like_forum)) {
+    fail("InvalidResponse", "贴吧没有返回关注吧列表");
+  }
+  return { rows: root.like_forum as unknown[], hasMore: isTrue(root.like_forum_has_more) };
+}
+
+async function loadFollowedPage(batch: number, context: PluginInvocationContextV1, cookies: TiebaCookie[]) {
+  const profile = await verifiedAccount(context.origin, cookies);
+  const portrait = profile?.avatarUrl?.match(/\/([\w.-]+)(?:[?#]|$)/)?.[1];
+  if (!profile || profile.key.id !== context.accountId || !portrait) {
+    fail("AuthenticationRequired", "请登录贴吧后查看完整关注列表");
+  }
+  const query = {
+    _client_type: "20",
+    pn: String(batch),
+    portrait,
+    rn: String(FOLLOWED_PAGE_SIZE),
+    subapp_type: "pc",
+  };
+  const parts = Object.entries(query).map(([name, value]) => name + "=" + value);
+  // Tieba's desktop endpoint uses a legacy MD5 request checksum for these public parameters.
+  const sign = md5Ascii(parts.join("") + PC_FORUM_SIGN_SALT);
+  const response = await hostRequest(context.origin + "/c/f/pc/myForumList?" + parts.join("&") + "&sign=" + sign, cookies);
+  requireStatus(response);
+  const root = parseJsonObject(response.body);
+  const data = asObject(root?.data);
+  if (Number(root?.error_code) !== 0 || !data || !Array.isArray(data.like)) {
+    fail("InvalidResponse", "贴吧没有返回关注吧的分页数据");
+  }
+  const rows = data.like as unknown[];
+  return { rows, next: rows.length && isTrue(data.has_more) ? "followed:" + (batch + 1) : undefined };
+}
+
+function forumCatalog(followed: unknown[], recommended: unknown[], cursor?: string): PageV1<TimelineSectionV1> {
   const seen = new Set<string>();
   const sections: TimelineSectionV1[] = [];
   for (const [id, title, forums] of [
-    ["liked", { key: "catalog.followed", fallback: "Followed forums" }, asArray(liked?.list ?? data.like_forum)],
-    ["recommended", { key: "catalog.recommended", fallback: "Recommended forums" }, asArray(data.recomm_forum)],
+    ["liked", { key: "catalog.followed", fallback: "Followed forums" }, followed],
+    ["recommended", { key: "catalog.recommended", fallback: "Recommended forums" }, recommended],
   ] as const) {
     const items: TimelineDescriptorV1[] = [];
     for (const value of forums) {
@@ -221,7 +276,7 @@ async function loadCatalog(page: PageRequestV1, context: PluginInvocationContext
     }
     if (items.length) sections.push({ id, title, timelines: { items, endReached: true } });
   }
-  return { items: sections, endReached: true };
+  return { items: sections, olderCursor: cursor, endReached: cursor === undefined };
 }
 
 async function hotTopics(context: PluginInvocationContextV1): Promise<{ type: "feed"; feed: FeedV1 }[]> {
@@ -406,7 +461,45 @@ function mapUser(value: unknown, accountId?: string): ProfileV1 | undefined {
   };
 }
 
-async function loadFloors(tid: string, offset: number, context: PluginInvocationContextV1) {
+async function loadPostDetail(id: string, context: PluginInvocationContextV1): Promise<PostV1> {
+  const ref = postRef(id);
+  if (!ref) fail("NotFound", "找不到这篇帖子");
+  if (ref.pid && ref.parent) {
+    const page = await loadSubfloors(ref.tid, ref.parent.pid, ref.offset ?? 0, context);
+    const floor = page.floors.find(({ pid }) => pid === ref.pid);
+    if (floor) return mapFloor(floor, ref.tid, id, ref.parent);
+    fail("NotFound", "找不到这条楼中楼回复");
+  }
+  let offset = ref.offset ?? 0;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const page = await loadFloors(ref.tid, offset, context);
+    const floor = ref.pid ? page.floors.find(({ pid }) => pid === ref.pid) : firstFloor(page.floors);
+    if (floor) return mapMainPost(floor, ref.tid, id, page.forum ?? "", ref.pid ? undefined : page.repliesCount, context);
+    // Existing reply keys did not carry the offset.
+    if (ref.offset !== undefined || page.nextOffset === undefined) break;
+    offset = page.nextOffset;
+  }
+  fail("NotFound", "找不到这条帖子或回复");
+}
+
+function firstFloor(floors: Floor[]): Floor {
+  const floor = floors.find(({ index }) => index === 1);
+  if (!floor) fail("NotFound", "楼主的正文暂不可用");
+  return floor;
+}
+
+async function mapMainPost(floor: Floor, tid: string, id: string, forum: string,
+  repliesCount: number | undefined, context: PluginInvocationContextV1): Promise<PostV1> {
+  const post = mapFloor(floor, tid, id, undefined, forum);
+  if (repliesCount !== undefined) post.repliesCount = repliesCount;
+  if (floor.media.some(({ type }) => type === "image" || type === "gif")) {
+    const originals = await loadOriginalImages(tid, floor.pid, context).catch(() => []);
+    if (originals.length) post.media = [...originals, ...floor.media.filter(({ type }) => type === "video")];
+  }
+  return post;
+}
+
+async function loadFloors(tid: string, offset: number, context: PluginInvocationContextV1): Promise<FloorPage> {
   const path = "/mo/q/pb?kz=" + tid + "&pn=" + (offset || 1);
   if (offset === 0) {
     const html = (await requestSite(path, context, true)).body;
@@ -421,7 +514,7 @@ async function loadFloors(tid: string, offset: number, context: PluginInvocation
   return { floors: parseFloors(text(data.html)), nextOffset: nextFloorOffset(asObject(data.page), offset), forum: "", repliesCount: undefined };
 }
 
-async function loadSubfloors(tid: string, parent: string, offset: number, context: PluginInvocationContextV1) {
+async function loadSubfloors(tid: string, parent: string, offset: number, context: PluginInvocationContextV1): Promise<FloorPage> {
   const data = await requestData("/mo/q/flr?kz=" + tid + "&pid=" + parent + "&pnum=" + (offset || 1), context);
   const info = asObject(data.page);
   const current = positiveInt(info?.current_page) ?? 1;
@@ -701,12 +794,18 @@ async function readCookies(context: PluginInvocationContextV1): Promise<TiebaCoo
   });
 }
 
-async function hostRequest(url: string, cookies: TiebaCookie[], html = false): Promise<HttpResponseV1> {
+async function hostRequest(url: string, cookies: TiebaCookie[], html = false,
+  options?: Pick<HttpRequestV1, "method" | "headers" | "body">): Promise<HttpResponseV1> {
   try {
     return await flare.http.request({
+      ...options,
       url,
       cookies,
-      headers: html ? { ...JSON_HEADERS, Accept: "text/html,application/xhtml+xml,*/*;q=0.8" } : JSON_HEADERS,
+      headers: {
+        ...JSON_HEADERS,
+        ...(html ? { Accept: "text/html,application/xhtml+xml,*/*;q=0.8" } : {}),
+        ...options?.headers,
+      },
     });
   } catch (error) {
     if (asObject(error)?.code === "host.unavailable") fail("Network", "暂时无法连接贴吧");

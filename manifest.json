@@ -3,7 +3,7 @@
   "schemaVersion": 1,
   "apiVersion": 1,
   "id": "dev.maxlec.tieba",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "defaultLocale": "zh-Hans",
   "name": {
     "key": "plugin.name",
@@ -44,7 +44,7 @@
               "cookies": [
                 {
                   "name": "BDUSS",
-                  "required": true
+                  "required": false
                 },
                 {
                   "name": "BDUSS_BFESS",
@@ -81,7 +81,12 @@
       },
       "flare.datasource.tab-catalog/v1": {
         "operations": {
-          "page": {}
+          "page": {
+            "directions": [
+              "refresh",
+              "older"
+            ]
+          }
         }
       },
       "flare.datasource.post/v1": {
