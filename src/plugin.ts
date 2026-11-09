@@ -211,7 +211,13 @@ async function loadCatalog(page: PageRequestV1, context: PluginInvocationContext
       const name = text(forum?.forum_name ?? forum?.name).trim();
       if (!name || seen.has(name)) continue;
       seen.add(name);
-      items.push({ id: "forum:" + name, title: { value: name + "吧" }, icon: "List", parameters: { kw: name } });
+      const forumId = numericId(forum?.forum_id ?? forum?.id);
+      items.push({
+        id: forumId ? "forum-" + forumId : "forum",
+        title: { value: name + "吧" },
+        icon: "List",
+        parameters: { kw: name },
+      });
     }
     if (items.length) sections.push({ id, title, timelines: { items, endReached: true } });
   }
