@@ -3,7 +3,7 @@
   "schemaVersion": 1,
   "apiVersion": 1,
   "id": "dev.maxlec.tieba",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "defaultLocale": "zh-Hans",
   "name": {
     "key": "plugin.name",

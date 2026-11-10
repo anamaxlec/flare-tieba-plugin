@@ -27,6 +27,7 @@ const CAPABILITIES = {
 
 type JsonObject = Record<string, unknown>;
 type TiebaCookie = { name: string; value: string };
+type ThreadPreview = { post: PostV1; title: string; summary: string; lastActivity: string };
 type FloorPage = { floors: Floor[]; nextOffset?: number; forum?: string; repliesCount?: number };
 
 type Floor = {
@@ -85,7 +86,7 @@ defineFlareSocialPlugin({
       async page(request, context) {
         const { timelineId, page } = request;
         if (timelineId === "hot") return pageRows(await hotTopics(context), page);
-        if (timelineId === "recommend") return loadRecommendations(page, context);
+        if (timelineId === "recommend") return loadRecommendations(page, context, true);
         const forum = text(request.parameters.kw || page.parameters.kw || timelineId.match(/^forum:(.+)$/)?.[1]).trim();
         if (!forum) fail("Unsupported", "找不到此时间线对应的贴吧");
         return loadForum(forum, page, context);
@@ -148,10 +149,8 @@ defineFlareSocialPlugin({
         const loaded = await (parent ? loadSubfloors(ref.tid, parent.pid, batch, context) : loadFloors(ref.tid, batch, context));
         const items: TimelineItemV1[] = loaded.floors.filter(({ index }) => parent || index !== 1).map((floor) => ({
           type: "post" as const,
-          post: {
-            ...mapFloor(floor, ref.tid, replyKey(ref.tid, floor.pid, batch, parent), parent),
-            replyTo: request.key,
-          },
+          // The main floor is already a row in this page. Reply references make Flare repeat it above each reply.
+          post: { ...mapFloor(floor, ref.tid, replyKey(ref.tid, floor.pid, batch, parent), parent), replyTo: undefined },
         }));
         const result = pageRows(items, { ...page, limit: page.limit - Number(refresh) },
           { batch, skip }, loaded.nextOffset !== undefined, loaded.nextOffset);
@@ -311,10 +310,12 @@ async function recommendedPosts(batch: number, context: PluginInvocationContextV
   return { items: mapThreads(rows), hasMore: rows.length > 0 };
 }
 
-async function loadRecommendations(page: PageRequestV1, context: PluginInvocationContextV1): Promise<PageV1<TimelineItemV1>> {
+async function loadRecommendations(
+  page: PageRequestV1, context: PluginInvocationContextV1, compact = false,
+): Promise<PageV1<TimelineItemV1>> {
   const position = pagePosition(page);
   const { items, hasMore } = await recommendedPosts(position.batch, context);
-  return pageRows(items, page, position, hasMore);
+  return pageRows(items.map(compact ? threadFeed : threadPost), page, position, hasMore);
 }
 
 async function loadForum(forum: string, page: PageRequestV1, context: PluginInvocationContextV1): Promise<PageV1<TimelineItemV1>> {
@@ -332,7 +333,7 @@ async function loadForum(forum: string, page: PageRequestV1, context: PluginInvo
   const offset = numberOrUndefined(info?.offset) ?? position.batch;
   const next = offset + size;
   const hasMore = list.length > 0 && next < (positiveInt(info?.total_page) ?? 1) * size && next > position.batch;
-  return pageRows(mapThreads(list, forum), page, position, hasMore, next);
+  return pageRows(mapThreads(list, forum).map(threadFeed), page, position, hasMore, next);
 }
 
 async function loadPostSearch({ query, page }: SearchRequestV1, context: PluginInvocationContextV1): Promise<PageV1<TimelineItemV1>> {
@@ -341,7 +342,7 @@ async function loadPostSearch({ query, page }: SearchRequestV1, context: PluginI
   const position = pagePosition(page);
   const suffix = "?word=" + encodeURIComponent(word) + "&pn=" + position.batch;
   const data = await requestData("/mo/q/search/thread" + suffix, context);
-  const posts: TimelineItemV1[] = mapThreads(asArray(data.post_list));
+  const posts = mapThreads(asArray(data.post_list)).map(threadPost);
   if (position.batch === 1) {
     // The search surface has no forum entity. Put an exact forum match above the posts.
     const forums = await requestData("/mo/q/search/forum" + suffix, context).catch(() => undefined);
@@ -383,8 +384,8 @@ async function findProfile(handle: string, context: PluginInvocationContextV1): 
   return profile;
 }
 
-function mapThreads(rows: unknown[], forum?: string): { type: "post"; post: PostV1 }[] {
-  const posts = new Map<string, PostV1>();
+function mapThreads(rows: unknown[], forum?: string): ThreadPreview[] {
+  const posts = new Map<string, ThreadPreview>();
   for (const value of rows) {
     const thread = asObject(value);
     const tid = numericId(thread?.tid ?? thread?.id);
@@ -393,7 +394,7 @@ function mapThreads(rows: unknown[], forum?: string): { type: "post"; post: Post
     const summary = text(thread.abstract ?? thread.thread_abstract ?? thread.content).trim();
     const media = threadMedia(thread, tid);
     const parts = [title && "<b>" + escapeHtml(title) + "</b>", summary && escapeHtml(summary).replace(/\n/g, "<br>")];
-    posts.set(tid, {
+    const post: PostV1 = {
       key: key(tid),
       author: mapUser(thread.author ?? thread.user ?? thread),
       createdAt: postTime(thread.create_time ?? thread.time ?? thread.last_time_int),
@@ -405,9 +406,42 @@ function mapThreads(rows: unknown[], forum?: string): { type: "post"; post: Post
       favouritesCount: numberOrUndefined(thread.agree_num ?? thread.like_num),
       sourceChannel: forumChannel(forum ?? text(thread.forum_name), thread.forum_id),
       sourceLanguages: LANGUAGE,
-    });
+    };
+    const lastActivity = isoFromEpoch(thread.last_time_int) ?? isoFromEpoch(thread.last_time) ??
+      parseTiebaTime(text(thread.last_time)) ?? isoFromEpoch(thread.create_time ?? thread.time);
+    posts.set(tid, { post, title, summary, lastActivity: lastActivity ?? new Date(0).toISOString() });
   }
-  return [...posts.values()].map((post) => ({ type: "post", post }));
+  return [...posts.values()];
+}
+
+function threadPost({ post }: ThreadPreview): TimelineItemV1 {
+  return { type: "post", post };
+}
+
+function threadFeed({ post, title, summary, lastActivity }: ThreadPreview): TimelineItemV1 {
+  const heading = decodeEntities(title);
+  const preview = decodeEntities(summary).replace(/\s+/g, " ").trim();
+  const shortened = Array.from(preview).slice(0, 88).join("");
+  const description = [
+    post.repliesCount === undefined ? "" : post.repliesCount + " 条回复",
+    heading && preview !== heading ? shortened + (shortened.length < preview.length ? "…" : "") : "",
+  ].filter(Boolean).join(" · ");
+  return {
+    type: "feed",
+    feed: {
+      url: threadUrl(post.key.id),
+      createdAt: lastActivity,
+      title: heading || shortened || "贴吧帖子",
+      source: {
+        name: [post.author?.displayName, post.sourceChannel?.name].filter(Boolean).join(" · ") || "百度贴吧",
+        iconUrl: post.author?.avatarUrl,
+      },
+      description: description ? { format: "plain", value: description } : undefined,
+      media: post.media?.find(({ type }) => type === "image"),
+      target: { type: "post", key: post.key },
+      sourceLanguages: LANGUAGE,
+    },
+  };
 }
 
 function threadMedia(thread: JsonObject, tid: string): MediaV1[] {
