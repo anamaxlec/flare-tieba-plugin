@@ -7,6 +7,7 @@ const ACCOUNT_PATH = "/mo/q/newmoindex?need_user=1";
 const CATALOG_PATH = "/mg/o/getForumHome?st=0&pn=0&rn=50&eqid=&refer=";
 const FORUM_GUIDE_PATH = "/c/f/forum/forumGuide";
 const FOLLOWED_PAGE_SIZE = 100;
+const HOT_TOPIC_PAGE_SIZE = 15;
 const PC_FORUM_SIGN_SALT = "36770b1f34c9bbf2e7d1a99d2b82fa9e";
 const LANGUAGE = ["zh-CN"];
 const JSON_HEADERS = {
@@ -132,10 +133,16 @@ defineFlareSocialPlugin({
     },
     post: {
       async detail({ key: { id } }, context) {
-        return { post: await loadPostDetail(id, context) };
+        const topicId = hotTopicId(id);
+        const post = topicId
+          ? hotTopicPost(topicId, (await fetchHotTopic(topicId, 1, "0", context)).topic_info)
+          : await loadPostDetail(id, context);
+        return { post };
       },
       async context(request, context) {
         const id = request.key.id;
+        const topicId = hotTopicId(id);
+        if (topicId) return loadHotTopic(topicId, request.page, context);
         const ref = postRef(id);
         if (!ref) fail("NotFound", "找不到这篇帖子");
         const page = request.page;
@@ -286,7 +293,7 @@ async function hotTopics(context: PluginInvocationContextV1): Promise<{ type: "f
     const id = numericId(topic?.topic_id);
     const title = text(topic?.topic_name).trim();
     if (!topic || !id || !title) return [];
-    const url = TIEBA_ORIGIN + "/hottopic/browse/hottopic?topic_id=" + id + "&topic_name=" + encodeURIComponent(title);
+    const url = hotTopicUrl(id, title);
     const picture = httpsUrl(text(topic.topic_pic));
     const summary = text(topic.topic_desc ?? topic.abstract);
     return [{
@@ -296,12 +303,89 @@ async function hotTopics(context: PluginInvocationContextV1): Promise<{ type: "f
         title,
         createdAt: postTime(topic.create_time),
         source: { name: "贴吧热议" },
+        target: { type: "post", key: key("hot:" + id) },
         description: summary ? { format: "plain", value: summary } : undefined,
         media: picture ? { id: "hot-" + id, type: "image", url: picture } : undefined,
         sourceLanguages: LANGUAGE,
       },
     }];
   });
+}
+
+function hotTopicId(id: string): string | undefined {
+  return /^hot:(\d+)$/.exec(id)?.[1];
+}
+
+function hotTopicUrl(id: string, title: string): string {
+  return TIEBA_ORIGIN + "/hottopic/browse/hottopic?topic_id=" + id + "&topic_name=" + encodeURIComponent(title);
+}
+
+async function fetchHotTopic(id: string, batch: number, lastId: string, context: PluginInvocationContextV1) {
+  const response = await requestSite("/c/f/hottopic/topicDetail?topic_id=" + id + "&is_share=1&is_new=1&pn=" + batch +
+    "&rn=" + HOT_TOPIC_PAGE_SIZE + "&offset=" + (batch - 1) * HOT_TOPIC_PAGE_SIZE + "&last_id=" + lastId +
+    "&_client_type=wap_smart", context);
+  const data = parseJsonObject(response.body);
+  if (!data) fail("InvalidResponse", "贴吧返回了无法读取的热议话题");
+  if (Number(data.error_code) !== 0) {
+    const message = text(data.error_msg);
+    if (/不存在|已删除/.test(message)) fail("NotFound", message);
+    fail("Remote", message || "贴吧热议话题暂不可用");
+  }
+  return data;
+}
+
+function hotTopicPost(id: string, value: unknown): PostV1 {
+  const topic = asObject(value);
+  const title = text(topic?.topic_name).trim();
+  if (!topic || numericId(topic.topic_id) !== id || !title) fail("NotFound", "找不到这个贴吧热议话题");
+  const summary = text(topic.topic_desc).trim();
+  const cover = httpsUrl(text(topic.topic_pic) || text(asObject(asArray(topic.media)[0])?.src_pic));
+  const postId = "hot:" + id;
+  return {
+    key: key(postId),
+    createdAt: isoFromEpoch(topic.create_time) ?? new Date(0).toISOString(),
+    content: { format: "html", value: "<b>" + escapeHtml(title) + "</b>" +
+      (summary ? "<br>" + escapeHtml(summary).replace(/\n/g, "<br>") : "") },
+    url: hotTopicUrl(id, title),
+    media: cover ? [{ type: "image", id: postId + "-cover", url: cover }] : undefined,
+    sourceLanguages: LANGUAGE,
+  };
+}
+
+async function loadHotTopic(id: string, page: PageRequestV1, context: PluginInvocationContextV1): Promise<PageV1<TimelineItemV1>> {
+  const cursor = /^(\d+):(\d+):(\d+):(\d+)$/.exec(page.direction === "refresh" ? "1:0:0:0" : page.cursor ?? "");
+  const batch = Number(cursor?.[1]);
+  const skip = Number(cursor?.[2]);
+  if (!cursor || page.direction === "newer" || !Number.isSafeInteger(batch) || batch < 1 || !Number.isSafeInteger(skip)) {
+    fail("Validation", "热议话题的分页位置无效");
+  }
+  const [, , , lastId, pinnedId] = cursor;
+  const data = await fetchHotTopic(id, batch, lastId, context);
+  const cards = asArray(data.area_card_list).flatMap((area) => asArray(asObject(area)?.card_data));
+  let featured = pinnedId;
+  const threads = cards.flatMap((value) => {
+    const card = asObject(value);
+    const thread = asObject(asObject(card?.data)?.thread_info) ??
+      (card?.card_type === "hot-thread" ? asObject(card.card_data) : undefined);
+    if (!thread) return [];
+    if (batch === 1 && featured === "0" && card?.card_type === "common_thread") {
+      featured = numericId(thread.tid) ?? "0";
+    }
+    return [thread];
+  });
+  const related = mapThreads(threads);
+  const rows: TimelineItemV1[] = related.filter(({ post }) => batch === 1 || post.key.id !== featured).map(threadPost);
+  if (batch === 1) rows.unshift({ type: "post", post: hotTopicPost(id, data.topic_info) });
+
+  const items = rows.slice(skip, skip + page.limit);
+  const end = skip + items.length;
+  const nextId = numericId(threads[threads.length - 1]?.tid);
+  const olderCursor = end < rows.length
+    ? [batch, end, lastId, featured].join(":")
+    : isTrue(data.has_more) && nextId && nextId !== lastId
+      ? [batch + 1, 0, nextId, featured].join(":")
+      : undefined;
+  return { items, olderCursor, endReached: olderCursor === undefined };
 }
 
 async function recommendedPosts(batch: number, context: PluginInvocationContextV1) {
@@ -391,7 +475,9 @@ function mapThreads(rows: unknown[], forum?: string): ThreadPreview[] {
     const tid = numericId(thread?.tid ?? thread?.id);
     if (!thread || !tid || posts.has(tid)) continue;
     const title = text(thread.title ?? thread.thread_title).trim();
-    const summary = text(thread.abstract ?? thread.thread_abstract ?? thread.content).trim();
+    const excerpt = thread.abstract ?? thread.thread_abstract ?? thread.content;
+    const summary = (text(excerpt) || asArray(excerpt).map((part) => text(asObject(part)?.text)).join("")).trim();
+    const forumInfo = asObject(thread.forum_info);
     const media = threadMedia(thread, tid);
     const parts = [title && "<b>" + escapeHtml(title) + "</b>", summary && escapeHtml(summary).replace(/\n/g, "<br>")];
     const post: PostV1 = {
@@ -404,7 +490,8 @@ function mapThreads(rows: unknown[], forum?: string): ThreadPreview[] {
       media,
       repliesCount: numberOrUndefined(thread.reply_num ?? thread.post_num),
       favouritesCount: numberOrUndefined(thread.agree_num ?? thread.like_num),
-      sourceChannel: forumChannel(forum ?? text(thread.forum_name), thread.forum_id),
+      sourceChannel: forumChannel(forum ?? text(thread.forum_name ?? thread.fname ?? forumInfo?.name),
+        thread.forum_id ?? thread.fid ?? forumInfo?.id),
       sourceLanguages: LANGUAGE,
     };
     const lastActivity = isoFromEpoch(thread.last_time_int) ?? isoFromEpoch(thread.last_time) ??
@@ -426,16 +513,18 @@ function threadFeed({ post, title, summary, lastActivity }: ThreadPreview): Time
     post.repliesCount === undefined ? "" : post.repliesCount + " 条回复",
     heading && preview !== heading ? shortened + (shortened.length < preview.length ? "…" : "") : "",
   ].filter(Boolean).join(" · ");
+  const source = {
+    name: [post.author?.displayName, post.sourceChannel?.name].filter(Boolean).join(" · ") || "百度贴吧",
+    iconUrl: post.author?.avatarUrl,
+    iconIsAvatar: Boolean(post.author?.avatarUrl),
+  };
   return {
     type: "feed",
     feed: {
       url: threadUrl(post.key.id),
       createdAt: lastActivity,
       title: heading || shortened || "贴吧帖子",
-      source: {
-        name: [post.author?.displayName, post.sourceChannel?.name].filter(Boolean).join(" · ") || "百度贴吧",
-        iconUrl: post.author?.avatarUrl,
-      },
+      source,
       description: description ? { format: "plain", value: description } : undefined,
       media: post.media?.find(({ type }) => type === "image"),
       target: { type: "post", key: post.key },
@@ -448,7 +537,7 @@ function threadMedia(thread: JsonObject, tid: string): MediaV1[] {
   const media: MediaV1[] = [];
   for (const value of asArray(thread.media)) {
     const item = asObject(value);
-    if (!item || text(item.type) !== "pic") continue;
+    if (!item || !["pic", "3"].includes(text(item.type))) continue;
     const url = httpsUrl(text(item.big_pic || item.src_pic || item.water_pic || item.static_img));
     if (!url || media.some((image) => image.url === url)) continue;
     media.push({

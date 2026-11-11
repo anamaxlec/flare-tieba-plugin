@@ -157,6 +157,7 @@
   var CATALOG_PATH = "/mg/o/getForumHome?st=0&pn=0&rn=50&eqid=&refer=";
   var FORUM_GUIDE_PATH = "/c/f/forum/forumGuide";
   var FOLLOWED_PAGE_SIZE = 100;
+  var HOT_TOPIC_PAGE_SIZE = 15;
   var PC_FORUM_SIGN_SALT = "36770b1f34c9bbf2e7d1a99d2b82fa9e";
   var LANGUAGE = ["zh-CN"];
   var JSON_HEADERS = {
@@ -262,10 +263,14 @@
       },
       post: {
         async detail({ key: { id } }, context) {
-          return { post: await loadPostDetail(id, context) };
+          const topicId = hotTopicId(id);
+          const post = topicId ? hotTopicPost(topicId, (await fetchHotTopic(topicId, 1, "0", context)).topic_info) : await loadPostDetail(id, context);
+          return { post };
         },
         async context(request, context) {
           const id = request.key.id;
+          const topicId = hotTopicId(id);
+          if (topicId) return loadHotTopic(topicId, request.page, context);
           const ref = postRef(id);
           if (!ref) fail("NotFound", "\u627E\u4E0D\u5230\u8FD9\u7BC7\u5E16\u5B50");
           const page = request.page;
@@ -406,7 +411,7 @@
       const id = numericId(topic?.topic_id);
       const title = text(topic?.topic_name).trim();
       if (!topic || !id || !title) return [];
-      const url = TIEBA_ORIGIN + "/hottopic/browse/hottopic?topic_id=" + id + "&topic_name=" + encodeURIComponent(title);
+      const url = hotTopicUrl(id, title);
       const picture = httpsUrl(text(topic.topic_pic));
       const summary = text(topic.topic_desc ?? topic.abstract);
       return [{
@@ -416,12 +421,75 @@
           title,
           createdAt: postTime(topic.create_time),
           source: { name: "\u8D34\u5427\u70ED\u8BAE" },
+          target: { type: "post", key: key("hot:" + id) },
           description: summary ? { format: "plain", value: summary } : void 0,
           media: picture ? { id: "hot-" + id, type: "image", url: picture } : void 0,
           sourceLanguages: LANGUAGE
         }
       }];
     });
+  }
+  function hotTopicId(id) {
+    return /^hot:(\d+)$/.exec(id)?.[1];
+  }
+  function hotTopicUrl(id, title) {
+    return TIEBA_ORIGIN + "/hottopic/browse/hottopic?topic_id=" + id + "&topic_name=" + encodeURIComponent(title);
+  }
+  async function fetchHotTopic(id, batch, lastId, context) {
+    const response = await requestSite("/c/f/hottopic/topicDetail?topic_id=" + id + "&is_share=1&is_new=1&pn=" + batch + "&rn=" + HOT_TOPIC_PAGE_SIZE + "&offset=" + (batch - 1) * HOT_TOPIC_PAGE_SIZE + "&last_id=" + lastId + "&_client_type=wap_smart", context);
+    const data = parseJsonObject(response.body);
+    if (!data) fail("InvalidResponse", "\u8D34\u5427\u8FD4\u56DE\u4E86\u65E0\u6CD5\u8BFB\u53D6\u7684\u70ED\u8BAE\u8BDD\u9898");
+    if (Number(data.error_code) !== 0) {
+      const message = text(data.error_msg);
+      if (/不存在|已删除/.test(message)) fail("NotFound", message);
+      fail("Remote", message || "\u8D34\u5427\u70ED\u8BAE\u8BDD\u9898\u6682\u4E0D\u53EF\u7528");
+    }
+    return data;
+  }
+  function hotTopicPost(id, value) {
+    const topic = asObject(value);
+    const title = text(topic?.topic_name).trim();
+    if (!topic || numericId(topic.topic_id) !== id || !title) fail("NotFound", "\u627E\u4E0D\u5230\u8FD9\u4E2A\u8D34\u5427\u70ED\u8BAE\u8BDD\u9898");
+    const summary = text(topic.topic_desc).trim();
+    const cover = httpsUrl(text(topic.topic_pic) || text(asObject(asArray(topic.media)[0])?.src_pic));
+    const postId = "hot:" + id;
+    return {
+      key: key(postId),
+      createdAt: isoFromEpoch(topic.create_time) ?? (/* @__PURE__ */ new Date(0)).toISOString(),
+      content: { format: "html", value: "<b>" + escapeHtml(title) + "</b>" + (summary ? "<br>" + escapeHtml(summary).replace(/\n/g, "<br>") : "") },
+      url: hotTopicUrl(id, title),
+      media: cover ? [{ type: "image", id: postId + "-cover", url: cover }] : void 0,
+      sourceLanguages: LANGUAGE
+    };
+  }
+  async function loadHotTopic(id, page, context) {
+    const cursor = /^(\d+):(\d+):(\d+):(\d+)$/.exec(page.direction === "refresh" ? "1:0:0:0" : page.cursor ?? "");
+    const batch = Number(cursor?.[1]);
+    const skip = Number(cursor?.[2]);
+    if (!cursor || page.direction === "newer" || !Number.isSafeInteger(batch) || batch < 1 || !Number.isSafeInteger(skip)) {
+      fail("Validation", "\u70ED\u8BAE\u8BDD\u9898\u7684\u5206\u9875\u4F4D\u7F6E\u65E0\u6548");
+    }
+    const [, , , lastId, pinnedId] = cursor;
+    const data = await fetchHotTopic(id, batch, lastId, context);
+    const cards = asArray(data.area_card_list).flatMap((area) => asArray(asObject(area)?.card_data));
+    let featured = pinnedId;
+    const threads = cards.flatMap((value) => {
+      const card = asObject(value);
+      const thread = asObject(asObject(card?.data)?.thread_info) ?? (card?.card_type === "hot-thread" ? asObject(card.card_data) : void 0);
+      if (!thread) return [];
+      if (batch === 1 && featured === "0" && card?.card_type === "common_thread") {
+        featured = numericId(thread.tid) ?? "0";
+      }
+      return [thread];
+    });
+    const related = mapThreads(threads);
+    const rows = related.filter(({ post }) => batch === 1 || post.key.id !== featured).map(threadPost);
+    if (batch === 1) rows.unshift({ type: "post", post: hotTopicPost(id, data.topic_info) });
+    const items = rows.slice(skip, skip + page.limit);
+    const end = skip + items.length;
+    const nextId = numericId(threads[threads.length - 1]?.tid);
+    const olderCursor = end < rows.length ? [batch, end, lastId, featured].join(":") : isTrue(data.has_more) && nextId && nextId !== lastId ? [batch + 1, 0, nextId, featured].join(":") : void 0;
+    return { items, olderCursor, endReached: olderCursor === void 0 };
   }
   async function recommendedPosts(batch, context) {
     const data = await requestData("/mo/q/recommend?pn=" + batch, context);
@@ -501,7 +569,9 @@
       const tid = numericId(thread?.tid ?? thread?.id);
       if (!thread || !tid || posts.has(tid)) continue;
       const title = text(thread.title ?? thread.thread_title).trim();
-      const summary = text(thread.abstract ?? thread.thread_abstract ?? thread.content).trim();
+      const excerpt = thread.abstract ?? thread.thread_abstract ?? thread.content;
+      const summary = (text(excerpt) || asArray(excerpt).map((part) => text(asObject(part)?.text)).join("")).trim();
+      const forumInfo = asObject(thread.forum_info);
       const media = threadMedia(thread, tid);
       const parts = [title && "<b>" + escapeHtml(title) + "</b>", summary && escapeHtml(summary).replace(/\n/g, "<br>")];
       const post = {
@@ -514,7 +584,10 @@
         media,
         repliesCount: numberOrUndefined(thread.reply_num ?? thread.post_num),
         favouritesCount: numberOrUndefined(thread.agree_num ?? thread.like_num),
-        sourceChannel: forumChannel(forum ?? text(thread.forum_name), thread.forum_id),
+        sourceChannel: forumChannel(
+          forum ?? text(thread.forum_name ?? thread.fname ?? forumInfo?.name),
+          thread.forum_id ?? thread.fid ?? forumInfo?.id
+        ),
         sourceLanguages: LANGUAGE
       };
       const lastActivity = isoFromEpoch(thread.last_time_int) ?? isoFromEpoch(thread.last_time) ?? parseTiebaTime(text(thread.last_time)) ?? isoFromEpoch(thread.create_time ?? thread.time);
@@ -533,16 +606,18 @@
       post.repliesCount === void 0 ? "" : post.repliesCount + " \u6761\u56DE\u590D",
       heading && preview !== heading ? shortened + (shortened.length < preview.length ? "\u2026" : "") : ""
     ].filter(Boolean).join(" \xB7 ");
+    const source = {
+      name: [post.author?.displayName, post.sourceChannel?.name].filter(Boolean).join(" \xB7 ") || "\u767E\u5EA6\u8D34\u5427",
+      iconUrl: post.author?.avatarUrl,
+      iconIsAvatar: Boolean(post.author?.avatarUrl)
+    };
     return {
       type: "feed",
       feed: {
         url: threadUrl(post.key.id),
         createdAt: lastActivity,
         title: heading || shortened || "\u8D34\u5427\u5E16\u5B50",
-        source: {
-          name: [post.author?.displayName, post.sourceChannel?.name].filter(Boolean).join(" \xB7 ") || "\u767E\u5EA6\u8D34\u5427",
-          iconUrl: post.author?.avatarUrl
-        },
+        source,
         description: description ? { format: "plain", value: description } : void 0,
         media: post.media?.find(({ type }) => type === "image"),
         target: { type: "post", key: post.key },
@@ -554,7 +629,7 @@
     const media = [];
     for (const value of asArray(thread.media)) {
       const item = asObject(value);
-      if (!item || text(item.type) !== "pic") continue;
+      if (!item || !["pic", "3"].includes(text(item.type))) continue;
       const url = httpsUrl(text(item.big_pic || item.src_pic || item.water_pic || item.static_img));
       if (!url || media.some((image) => image.url === url)) continue;
       media.push({
